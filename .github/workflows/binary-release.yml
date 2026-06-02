@@ -1,0 +1,72 @@
+name: Binary Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, target: aarch64-apple-darwin, suffix: darwin-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustup target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cargo build
+        run: |
+          cargo build --release \
+            --target ${{ matrix.target }} \
+            -p msf
+
+      - name: Stage binary
+        run: |
+          set -eu
+          src="target/${{ matrix.target }}/release/msf"
+          dest="msf-${{ matrix.suffix }}"
+          cp "$src" "$dest"
+          ls -la "$dest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msf-${{ matrix.suffix }}
+          path: msf-${{ matrix.suffix }}
+
+  release:
+    needs: build
+    runs-on: macos-15
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Move binaries into a flat dir
+        run: |
+          set -eu
+          mkdir -p flat
+          find dist -type f -exec cp {} flat/ \;
+          ls -la flat/
+
+      - name: Generate checksums
+        run: |
+          set -eu
+          cd flat
+          shasum -a 256 msf-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" flat/* --generate-notes
