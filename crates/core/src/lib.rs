@@ -126,6 +126,13 @@ fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+pub fn clamp_rpm(target: f64, min: f64, max: f64) -> f64 {
+    if target.is_nan() {
+        return min;
+    }
+    target.clamp(min, max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +203,27 @@ mod tests {
         assert!(c.matches_host(&host("M", "B")));
         assert!(!c.matches_host(&host("M", "B2")));
         assert!(!c.matches_host(&host("M2", "B")));
+    }
+
+    #[test]
+    fn clamp_rpm_within_range_unchanged() {
+        assert_eq!(clamp_rpm(2000.0, 1200.0, 5779.0), 2000.0);
+    }
+
+    #[test]
+    fn clamp_rpm_below_min_pins_to_min() {
+        assert_eq!(clamp_rpm(500.0, 1200.0, 5779.0), 1200.0);
+    }
+
+    #[test]
+    fn clamp_rpm_above_max_pins_to_max() {
+        assert_eq!(clamp_rpm(9999.0, 1200.0, 5779.0), 5779.0);
+    }
+
+    #[test]
+    fn clamp_rpm_nan_returns_min() {
+        let v = clamp_rpm(f64::NAN, 1200.0, 5779.0);
+        assert_eq!(v, 1200.0);
     }
 
     #[test]

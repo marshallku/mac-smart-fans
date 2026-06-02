@@ -1,10 +1,12 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use msf_core::{Calibration, Host, Reading, SensorSource};
-use msf_smc::{FanProbe, KeyInfo};
+use msf_core::{Calibration, Host, Reading, SensorSource, clamp_rpm};
+use msf_smc::{FanProbe, KeyInfo, ManualFanSession};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +46,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Put a fan into manual mode at <rpm> for a bounded duration (root required)
+    Set {
+        /// Fan index (0..fan_count from probe)
+        fan: u8,
+        /// Target RPM
+        rpm: f64,
+        /// How long to hold the manual setpoint before auto-restore
+        #[arg(long, default_value_t = 10)]
+        duration_secs: u64,
+        /// Skip clamping to [F{N}Mn, F{N}Mx]
+        #[arg(long)]
+        no_clamp: bool,
+        /// Emit one JSON object per state transition
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -79,7 +97,192 @@ fn main() -> Result<()> {
         } => run_monitor(json, interval_secs, ticks, selected),
         Command::Calibrate { action } => run_calibrate(action),
         Command::Probe { json } => run_probe(json),
+        Command::Set {
+            fan,
+            rpm,
+            duration_secs,
+            no_clamp,
+            json,
+        } => run_set(fan, rpm, duration_secs, no_clamp, json),
     }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum SetEvent<'a> {
+    Armed { fan: u8, mode_key_type: &'a str },
+    TargetWritten { fan: u8, target_rpm: f64 },
+    Trip { sensor: &'a str, celsius: f64 },
+    RestoreStarted,
+    RestoreDone,
+    RestoreFailed,
+    Exit { code: i32, reason: &'a str },
+}
+
+fn emit_event(json: bool, ev: &SetEvent<'_>) {
+    if json {
+        if let Ok(s) = serde_json::to_string(ev) {
+            println!("{s}");
+        }
+    } else {
+        eprintln!("{ev:?}");
+    }
+}
+
+impl std::fmt::Debug for SetEvent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetEvent::Armed { fan, mode_key_type } => {
+                write!(f, "armed: fan={fan} mode_key_type={mode_key_type}")
+            }
+            SetEvent::TargetWritten { fan, target_rpm } => {
+                write!(f, "target_written: fan={fan} target_rpm={target_rpm}")
+            }
+            SetEvent::Trip { sensor, celsius } => {
+                write!(f, "TRIP: {sensor}={celsius:.1}°C")
+            }
+            SetEvent::RestoreStarted => write!(f, "restore_started"),
+            SetEvent::RestoreDone => write!(f, "restore_done"),
+            SetEvent::RestoreFailed => write!(f, "RESTORE-FAILED"),
+            SetEvent::Exit { code, reason } => write!(f, "exit: code={code} reason={reason:?}"),
+        }
+    }
+}
+
+const TRIP_THRESHOLD_C: f64 = 90.0;
+
+fn run_set(fan: u8, rpm: f64, duration_secs: u64, no_clamp: bool, json: bool) -> Result<()> {
+    if !rpm.is_finite() {
+        bail!("rpm must be a finite number (got {rpm})");
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!(
+            "msf set requires root (writes SMC keys). Re-run with: sudo msf set {fan} {rpm}"
+        );
+        std::process::exit(2);
+    }
+
+    let probe = msf_smc::probe()?;
+    if fan >= probe.fan_count {
+        bail!(
+            "fan {fan} out of range (probe reports fan_count={})",
+            probe.fan_count
+        );
+    }
+    let fp = &probe.fans[fan as usize];
+    let (Some(md_info), Some(tg_info), Some(casing)) = (&fp.md, &fp.tg, fp.mode_key_casing) else {
+        bail!(
+            "fan {fan} not controllable: Md/Tg/casing missing in probe"
+        );
+    };
+
+    let fan_readings = msf_smc::read_fans()?;
+    let live = fan_readings
+        .iter()
+        .find(|f| f.index == fan)
+        .ok_or_else(|| anyhow::anyhow!("fan {fan} not found in read_fans"))?;
+    let target = if no_clamp {
+        if rpm < live.min_rpm || rpm > live.max_rpm {
+            eprintln!(
+                "warning: --no-clamp; target {rpm} outside spec [{}, {}]",
+                live.min_rpm, live.max_rpm
+            );
+        }
+        rpm
+    } else {
+        let clamped = clamp_rpm(rpm, live.min_rpm, live.max_rpm);
+        if (clamped - rpm).abs() > 0.01 {
+            eprintln!("clamped target from {rpm} to {clamped} RPM");
+        }
+        clamped
+    };
+
+    let host = Host::detect()?;
+    let allowlist: Option<HashSet<String>> = match Calibration::load()? {
+        Some(c) if c.matches_host(&host) => Some(c.sensors.into_keys().collect()),
+        Some(_) => {
+            eprintln!(
+                "warning: calibration host mismatch; degraded trip — scanning all HID sensors"
+            );
+            None
+        }
+        None => {
+            eprintln!("warning: no calibration; degraded trip — scanning all HID sensors");
+            None
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))?;
+    }
+
+    let mut session = ManualFanSession::arm(fan, casing, md_info)?;
+    emit_event(
+        json,
+        &SetEvent::Armed {
+            fan,
+            mode_key_type: &md_info.data_type,
+        },
+    );
+
+    session.write_target(tg_info, target)?;
+    emit_event(
+        json,
+        &SetEvent::TargetWritten {
+            fan,
+            target_rpm: target,
+        },
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(duration_secs);
+    let mut tripped: Option<(String, f64)> = None;
+    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        if let Ok(temps) = msf_hid::read_all() {
+            for s in &temps {
+                let in_scope = allowlist.as_ref().is_none_or(|a| a.contains(&s.name));
+                if in_scope && s.celsius >= TRIP_THRESHOLD_C {
+                    tripped = Some((s.name.clone(), s.celsius));
+                    break;
+                }
+            }
+        }
+        if tripped.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+
+    if let Some((name, c)) = &tripped {
+        emit_event(
+            json,
+            &SetEvent::Trip {
+                sensor: name,
+                celsius: *c,
+            },
+        );
+    }
+
+    emit_event(json, &SetEvent::RestoreStarted);
+    let restore_ok = session.restore().unwrap_or(false);
+    if restore_ok {
+        emit_event(json, &SetEvent::RestoreDone);
+    } else {
+        emit_event(json, &SetEvent::RestoreFailed);
+    }
+
+    let (code, reason): (i32, &str) = if !restore_ok {
+        (3, "restore_failed")
+    } else if tripped.is_some() {
+        (4, "sensor_trip")
+    } else if stop.load(Ordering::SeqCst) {
+        (0, "sigint")
+    } else {
+        (0, "ttl")
+    };
+    emit_event(json, &SetEvent::Exit { code, reason });
+    std::process::exit(code);
 }
 
 #[derive(Serialize)]

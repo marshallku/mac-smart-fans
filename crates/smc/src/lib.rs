@@ -58,9 +58,6 @@ impl Probe {
         if self.fan_count == 0 {
             return Some("fan_count == 0".to_string());
         }
-        if self.ftst.is_none() {
-            return Some("Ftst key missing".to_string());
-        }
         for fan in &self.fans {
             if fan.md.is_none() {
                 return Some(format!("F{i}Md and F{i}md both missing", i = fan.index));
@@ -86,6 +83,7 @@ type IoConnect = IoObject;
 const KERN_SUCCESS: KernReturn = 0;
 const KERNEL_INDEX_SMC: u32 = 2;
 const SMC_CMD_READ_BYTES: u8 = 5;
+const SMC_CMD_WRITE_BYTES: u8 = 6;
 const SMC_CMD_READ_KEYINFO: u8 = 9;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -233,6 +231,27 @@ impl SmcConnection {
         Some(key_info_from_raw(&out.key_info))
     }
 
+    fn write_key(&self, key: u32, data_type: u32, data: &[u8]) -> Result<()> {
+        if data.len() > 32 {
+            return Err(anyhow!("smc write payload > 32 bytes"));
+        }
+        let mut bytes = [0u8; 32];
+        bytes[..data.len()].copy_from_slice(data);
+        let input = SmcKeyData {
+            key,
+            key_info: SmcKeyDataKeyInfo {
+                data_size: data.len() as u32,
+                data_type,
+                data_attributes: 0,
+            },
+            data8: SMC_CMD_WRITE_BYTES,
+            bytes,
+            ..Default::default()
+        };
+        let _ = self.call(&input)?;
+        Ok(())
+    }
+
     fn read_key(&self, key: u32) -> Result<(SmcKeyDataKeyInfo, [u8; 32])> {
         let info_out = self.call(&SmcKeyData {
             key,
@@ -331,6 +350,134 @@ pub fn probe() -> Result<Probe> {
         ftst,
         fans,
     })
+}
+
+fn fourcc_from_str(s: &str) -> Result<u32> {
+    let b = s.as_bytes();
+    if b.len() != 4 {
+        return Err(anyhow!("fourcc string must be 4 bytes: {s:?}"));
+    }
+    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn encode_one(data_type: &str, data_size: u32) -> Result<Vec<u8>> {
+    match (data_type, data_size) {
+        ("ui8 ", 1) => Ok(vec![1]),
+        ("flt ", 4) => Ok(1.0_f32.to_le_bytes().to_vec()),
+        _ => Err(anyhow!(
+            "unsupported mode key type/size: {data_type:?}/{data_size}"
+        )),
+    }
+}
+
+fn encode_zero(data_type: &str, data_size: u32) -> Result<Vec<u8>> {
+    match (data_type, data_size) {
+        ("ui8 ", 1) => Ok(vec![0]),
+        ("flt ", 4) => Ok(0.0_f32.to_le_bytes().to_vec()),
+        _ => Err(anyhow!(
+            "unsupported mode key type/size: {data_type:?}/{data_size}"
+        )),
+    }
+}
+
+fn encode_target(data_type: &str, data_size: u32, value: f64) -> Result<Vec<u8>> {
+    if !value.is_finite() {
+        return Err(anyhow!("target RPM must be finite (got {value})"));
+    }
+    match (data_type, data_size) {
+        ("flt ", 4) => Ok((value as f32).to_le_bytes().to_vec()),
+        ("fpe2", 2) => {
+            let scaled = (value * 4.0).round().clamp(0.0, u16::MAX as f64) as u16;
+            Ok(scaled.to_be_bytes().to_vec())
+        }
+        _ => Err(anyhow!(
+            "unsupported target key type/size: {data_type:?}/{data_size}"
+        )),
+    }
+}
+
+fn compose_mode_key(fan_index: u8, casing: ModeKeyCasing) -> u32 {
+    let (c1, c2) = match casing {
+        ModeKeyCasing::Upper => (b'M', b'd'),
+        ModeKeyCasing::Lower => (b'm', b'd'),
+    };
+    u32::from_be_bytes([b'F', b'0' + fan_index, c1, c2])
+}
+
+fn compose_target_key(fan_index: u8) -> u32 {
+    u32::from_be_bytes([b'F', b'0' + fan_index, b'T', b'g'])
+}
+
+pub struct ManualFanSession {
+    smc: SmcConnection,
+    fan_index: u8,
+    mode_key: u32,
+    mode_type: String,
+    mode_size: u32,
+    armed: bool,
+    restored: bool,
+}
+
+impl ManualFanSession {
+    pub fn arm(fan_index: u8, casing: ModeKeyCasing, mode_info: &KeyInfo) -> Result<Self> {
+        let smc = SmcConnection::open()?;
+        let mode_key = compose_mode_key(fan_index, casing);
+        let mode_type_fcc = fourcc_from_str(&mode_info.data_type)?;
+        let payload = encode_one(&mode_info.data_type, mode_info.data_size)?;
+
+        smc.write_key(mode_key, mode_type_fcc, &payload)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let (rb_info, rb_bytes) = smc.read_key(mode_key)?;
+        let rb = decode_numeric(&rb_info, &rb_bytes).unwrap_or(0.0);
+        if rb < 0.5 {
+            return Err(anyhow!(
+                "direct mode write rejected (Ftst absent — no fallback)"
+            ));
+        }
+
+        Ok(Self {
+            smc,
+            fan_index,
+            mode_key,
+            mode_type: mode_info.data_type.clone(),
+            mode_size: mode_info.data_size,
+            armed: true,
+            restored: false,
+        })
+    }
+
+    pub fn write_target(&self, target_info: &KeyInfo, target_rpm: f64) -> Result<()> {
+        let key = compose_target_key(self.fan_index);
+        let fcc = fourcc_from_str(&target_info.data_type)?;
+        let payload = encode_target(&target_info.data_type, target_info.data_size, target_rpm)?;
+        self.smc.write_key(key, fcc, &payload)
+    }
+
+    pub fn restore(&mut self) -> Result<bool> {
+        if !self.armed || self.restored {
+            return Ok(true);
+        }
+        let fcc = fourcc_from_str(&self.mode_type)?;
+        let payload = encode_zero(&self.mode_type, self.mode_size)?;
+        self.smc.write_key(self.mode_key, fcc, &payload)?;
+        let (rb_info, rb_bytes) = self.smc.read_key(self.mode_key)?;
+        let rb = decode_numeric(&rb_info, &rb_bytes).unwrap_or(1.0);
+        self.restored = rb < 0.5;
+        Ok(self.restored)
+    }
+
+    pub fn fan_index(&self) -> u8 {
+        self.fan_index
+    }
+}
+
+impl Drop for ManualFanSession {
+    fn drop(&mut self) {
+        if self.armed && !self.restored {
+            let _ = self.restore();
+        }
+    }
 }
 
 pub fn read_fans() -> Result<Vec<FanReading>> {
@@ -470,7 +617,9 @@ mod tests {
     }
 
     #[test]
-    fn probe_not_controllable_when_ftst_missing() {
+    fn probe_controllable_when_ftst_absent_but_direct_keys_present() {
+        // Ftst is absent on M1 Max Darwin 25.3.0; direct-mode unlock is the intended path,
+        // so Ftst missing must NOT mark the host as non-controllable.
         let p = Probe {
             fan_count: 1,
             ftst: None,
@@ -483,8 +632,8 @@ mod tests {
                 mx: None,
             }],
         };
-        assert!(!p.controllable());
-        assert_eq!(p.not_controllable_reason().as_deref(), Some("Ftst key missing"));
+        assert!(p.controllable());
+        assert_eq!(p.not_controllable_reason(), None);
     }
 
     #[test]
@@ -537,6 +686,59 @@ mod tests {
         let (casing, info) = select_mode_casing(None, None);
         assert_eq!(casing, None);
         assert_eq!(info, None);
+    }
+
+    #[test]
+    fn compose_mode_key_upper_and_lower() {
+        assert_eq!(compose_mode_key(0, ModeKeyCasing::Upper), fourcc(b"F0Md"));
+        assert_eq!(compose_mode_key(1, ModeKeyCasing::Upper), fourcc(b"F1Md"));
+        assert_eq!(compose_mode_key(0, ModeKeyCasing::Lower), fourcc(b"F0md"));
+    }
+
+    #[test]
+    fn compose_target_key_per_fan() {
+        assert_eq!(compose_target_key(0), fourcc(b"F0Tg"));
+        assert_eq!(compose_target_key(3), fourcc(b"F3Tg"));
+    }
+
+    #[test]
+    fn encode_one_supports_ui8_and_flt() {
+        assert_eq!(encode_one("ui8 ", 1).unwrap(), vec![1]);
+        assert_eq!(encode_one("flt ", 4).unwrap(), 1.0_f32.to_le_bytes().to_vec());
+        assert!(encode_one("ui16", 2).is_err());
+    }
+
+    #[test]
+    fn encode_zero_supports_ui8_and_flt() {
+        assert_eq!(encode_zero("ui8 ", 1).unwrap(), vec![0]);
+        assert_eq!(encode_zero("flt ", 4).unwrap(), 0.0_f32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn encode_target_flt_is_little_endian_f32() {
+        let bytes = encode_target("flt ", 4, 1500.0).unwrap();
+        assert_eq!(bytes, 1500.0_f32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn encode_target_fpe2_is_big_endian_fixed() {
+        // 100.5 → 100.5 * 4 = 402 = 0x0192
+        let bytes = encode_target("fpe2", 2, 100.5).unwrap();
+        assert_eq!(bytes, vec![0x01, 0x92]);
+    }
+
+    #[test]
+    fn encode_target_rejects_nan_and_inf() {
+        assert!(encode_target("flt ", 4, f64::NAN).is_err());
+        assert!(encode_target("flt ", 4, f64::INFINITY).is_err());
+        assert!(encode_target("flt ", 4, f64::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn fourcc_from_str_round_trip() {
+        let v = fourcc_from_str("F0Md").unwrap();
+        assert_eq!(v, fourcc(b"F0Md"));
+        assert!(fourcc_from_str("F0M").is_err());
     }
 
     #[test]
