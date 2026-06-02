@@ -53,9 +53,11 @@ Once you have a working curve profile:
 
 ```sh
 msf init --profile balanced --output ~/.config/msf/curve.toml
-sudo msf install --curve ~/.config/msf/curve.toml --fan 0
+sudo msf install --curve ~/.config/msf/curve.toml
 msf status
 ```
+
+By default the daemon controls **all controllable fans** (equivalent to `--fan all`). To target only specific fans, pass a single index (`--fan 0`) or a comma-separated list (`--fan 0,1`).
 
 This writes a LaunchDaemon plist at `/Library/LaunchDaemons/im.toss.mac-smart-fans.plist` (root:wheel 0644) and loads it via `launchctl bootstrap`. The daemon logs to `/var/log/msf/`.
 

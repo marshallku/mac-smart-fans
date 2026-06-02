@@ -24,8 +24,8 @@ msf probe                                        # SMC fan capability report
 msf calibrate add cpu <hid-id>                   # tag sensors for curve trip logic
 msf init --profile balanced -o curve.toml        # generate a starter curve
 sudo msf set 0 2500 --duration-secs 5            # one-shot fan set (auto-restore)
-sudo msf run --curve curve.toml --fan 0          # foreground curve loop
-sudo msf install --curve curve.toml --fan 0      # install as launchd daemon
+sudo msf run --curve curve.toml                  # foreground curve loop (all fans by default)
+sudo msf install --curve curve.toml              # install as launchd daemon (all fans by default)
 msf status                                       # daemon health
 ```
 

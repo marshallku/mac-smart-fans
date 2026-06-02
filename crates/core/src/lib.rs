@@ -1,8 +1,8 @@
 //! Sensor model, host detection, and the per-host calibration allowlist.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -301,6 +301,53 @@ pub struct FanSpec {
     pub index: u8,
     pub min_rpm: f64,
     pub max_rpm: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FanSelector {
+    All,
+    Indices(Vec<u8>),
+}
+
+pub fn parse_fan_selector(s: &str) -> Result<FanSelector> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        bail!("--fan: empty value (expected 'all' or comma-separated indices)");
+    }
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(FanSelector::All);
+    }
+    let mut seen: HashSet<u8> = HashSet::new();
+    let mut out: Vec<u8> = Vec::new();
+    for tok in trimmed.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            bail!("--fan: empty index in '{s}'");
+        }
+        let n: u8 = tok
+            .parse()
+            .map_err(|e| anyhow!("--fan: bad index '{tok}': {e}"))?;
+        if seen.insert(n) {
+            out.push(n);
+        }
+    }
+    Ok(FanSelector::Indices(out))
+}
+
+impl FanSelector {
+    pub fn resolve(&self, fan_count: u8) -> Result<Vec<u8>> {
+        match self {
+            FanSelector::All => Ok((0..fan_count).collect()),
+            FanSelector::Indices(v) => {
+                for &i in v {
+                    if i >= fan_count {
+                        bail!("--fan: index {i} out of range (fan_count={fan_count})");
+                    }
+                }
+                Ok(v.clone())
+            }
+        }
+    }
 }
 
 pub fn render_profile(host: &Host, fans: &[FanSpec], policy: Policy, curve: &Curve) -> String {
@@ -659,5 +706,104 @@ mod tests {
         let parsed: Curve = toml::from_str(&text).expect("rendered profile parses");
         assert!(parsed.validate().is_ok());
         assert_eq!(parsed.points, curve.points);
+    }
+
+    #[test]
+    fn parse_fan_selector_all_case_insensitive() {
+        assert_eq!(parse_fan_selector("all").unwrap(), FanSelector::All);
+        assert_eq!(parse_fan_selector("ALL").unwrap(), FanSelector::All);
+        assert_eq!(parse_fan_selector("All").unwrap(), FanSelector::All);
+        assert_eq!(parse_fan_selector("  all  ").unwrap(), FanSelector::All);
+    }
+
+    #[test]
+    fn parse_fan_selector_single_index() {
+        assert_eq!(
+            parse_fan_selector("0").unwrap(),
+            FanSelector::Indices(vec![0])
+        );
+        assert_eq!(
+            parse_fan_selector("3").unwrap(),
+            FanSelector::Indices(vec![3])
+        );
+    }
+
+    #[test]
+    fn parse_fan_selector_csv_order_preserved() {
+        assert_eq!(
+            parse_fan_selector("0,1").unwrap(),
+            FanSelector::Indices(vec![0, 1])
+        );
+        assert_eq!(
+            parse_fan_selector("1,0").unwrap(),
+            FanSelector::Indices(vec![1, 0])
+        );
+    }
+
+    #[test]
+    fn parse_fan_selector_dedupe() {
+        assert_eq!(
+            parse_fan_selector("0,0,1,0").unwrap(),
+            FanSelector::Indices(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn parse_fan_selector_whitespace_tolerant() {
+        assert_eq!(
+            parse_fan_selector("0, 1").unwrap(),
+            FanSelector::Indices(vec![0, 1])
+        );
+        assert_eq!(
+            parse_fan_selector(" 0 , 1 ").unwrap(),
+            FanSelector::Indices(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn parse_fan_selector_rejects_empty() {
+        assert!(parse_fan_selector("").is_err());
+        assert!(parse_fan_selector("   ").is_err());
+        assert!(parse_fan_selector("0,").is_err());
+        assert!(parse_fan_selector(",0").is_err());
+    }
+
+    #[test]
+    fn parse_fan_selector_rejects_nonnumeric() {
+        assert!(parse_fan_selector("abc").is_err());
+        assert!(parse_fan_selector("0,a").is_err());
+        assert!(parse_fan_selector("all,0").is_err());
+    }
+
+    #[test]
+    fn parse_fan_selector_rejects_negative_and_overflow() {
+        assert!(parse_fan_selector("-1").is_err());
+        assert!(parse_fan_selector("256").is_err());
+        assert!(parse_fan_selector("0,-1").is_err());
+    }
+
+    #[test]
+    fn fan_selector_resolve_all_expands_to_range() {
+        assert_eq!(FanSelector::All.resolve(0).unwrap(), Vec::<u8>::new());
+        assert_eq!(FanSelector::All.resolve(1).unwrap(), vec![0]);
+        assert_eq!(FanSelector::All.resolve(2).unwrap(), vec![0, 1]);
+        assert_eq!(FanSelector::All.resolve(3).unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn fan_selector_resolve_indices_in_range_passes_through() {
+        let s = FanSelector::Indices(vec![1, 0]);
+        assert_eq!(s.resolve(2).unwrap(), vec![1, 0]);
+        let s = FanSelector::Indices(vec![0]);
+        assert_eq!(s.resolve(2).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn fan_selector_resolve_indices_out_of_range_errors() {
+        let s = FanSelector::Indices(vec![0, 2]);
+        let err = s.resolve(2).unwrap_err().to_string();
+        assert!(err.contains("out of range"));
+        let s = FanSelector::Indices(vec![5]);
+        assert!(s.resolve(2).is_err());
     }
 }

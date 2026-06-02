@@ -2,9 +2,9 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use msf_core::{
     AsymmetricEma, Calibration, Curve, FanSpec, Host, Policy, Reading, SensorSource,
-    check_overwrite, clamp_rpm, profile_path, render_profile,
+    check_overwrite, clamp_rpm, parse_fan_selector, profile_path, render_profile,
 };
-use msf_smc::{FanProbe, KeyInfo, ManualFanSession};
+use msf_smc::{FanProbe, KeyInfo, ManualFanSession, ModeKeyCasing};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -83,9 +83,9 @@ enum Command {
         /// Path to TOML curve config
         #[arg(long)]
         curve: PathBuf,
-        /// Fan index to control
-        #[arg(long, default_value_t = 0)]
-        fan: u8,
+        /// Fans to control: `all`, a single index (`0`), or a comma-separated list (`0,1`)
+        #[arg(long, default_value_t = String::from("all"))]
+        fan: String,
         /// How long to run before auto-restore
         #[arg(long, default_value_t = 60)]
         duration_secs: u64,
@@ -98,9 +98,9 @@ enum Command {
         /// Curve TOML to bind into the plist
         #[arg(long)]
         curve: PathBuf,
-        /// Fan index for the daemon to control
-        #[arg(long, default_value_t = 0)]
-        fan: u8,
+        /// Fans the daemon controls: `all`, a single index (`0`), or a comma-separated list (`0,1`)
+        #[arg(long, default_value_t = String::from("all"))]
+        fan: String,
         /// Override binary path (default: current_exe() with /usr/local/bin/msf fallback)
         #[arg(long)]
         binary: Option<PathBuf>,
@@ -204,7 +204,7 @@ const DAEMON_DURATION_SECS: u64 = 31_536_000; // one year
 struct PlistConfig {
     binary: PathBuf,
     curve: PathBuf,
-    fan: u8,
+    fan: String,
 }
 
 fn render_plist(cfg: &PlistConfig) -> Result<Vec<u8>> {
@@ -218,7 +218,7 @@ fn render_plist(cfg: &PlistConfig) -> Result<Vec<u8>> {
             "--curve".into(),
             cfg.curve.display().to_string().into(),
             "--fan".into(),
-            cfg.fan.to_string().into(),
+            cfg.fan.clone().into(),
             "--duration-secs".into(),
             DAEMON_DURATION_SECS.to_string().into(),
         ]),
@@ -267,9 +267,61 @@ fn parse_curve_path_from_plist(path: &Path) -> Result<PathBuf> {
     Err(anyhow!("plist ProgramArguments has no --curve flag"))
 }
 
+struct FanCtx<'a> {
+    index: u8,
+    md_info: &'a KeyInfo,
+    tg_info: &'a KeyInfo,
+    casing: ModeKeyCasing,
+    min_rpm: f64,
+    max_rpm: f64,
+}
+
+fn build_fan_contexts<'a>(
+    indices: &[u8],
+    probe: &'a msf_smc::Probe,
+    live: &[msf_smc::FanReading],
+) -> Result<Vec<FanCtx<'a>>> {
+    if indices.is_empty() {
+        bail!(
+            "no fans selected (selector resolved to empty; probe.fan_count={})",
+            probe.fan_count
+        );
+    }
+    let mut out: Vec<FanCtx<'a>> = Vec::with_capacity(indices.len());
+    for &i in indices {
+        let fp = &probe.fans[i as usize];
+        let (Some(md), Some(tg), Some(casing)) = (&fp.md, &fp.tg, fp.mode_key_casing) else {
+            bail!("fan {i} not controllable: Md/Tg/casing missing in probe");
+        };
+        let live_spec = live
+            .iter()
+            .find(|f| f.index == i)
+            .ok_or_else(|| anyhow!("fan {i} not found in read_fans"))?;
+        if !live_spec.min_rpm.is_finite()
+            || !live_spec.max_rpm.is_finite()
+            || live_spec.min_rpm > live_spec.max_rpm
+        {
+            bail!(
+                "fan {i}: invalid rpm range Mn={} Mx={}",
+                live_spec.min_rpm,
+                live_spec.max_rpm
+            );
+        }
+        out.push(FanCtx {
+            index: i,
+            md_info: md,
+            tg_info: tg,
+            casing,
+            min_rpm: live_spec.min_rpm,
+            max_rpm: live_spec.max_rpm,
+        });
+    }
+    Ok(out)
+}
+
 fn run_install(
     curve: PathBuf,
-    fan: u8,
+    fan: String,
     binary: Option<PathBuf>,
     force: bool,
 ) -> Result<()> {
@@ -277,6 +329,17 @@ fn run_install(
         eprintln!("msf install requires root (writes /Library/LaunchDaemons/). Re-run with sudo.");
         std::process::exit(2);
     }
+
+    // Preflight: parse → probe → resolve → read_fans → controllability + live
+    // RPM range validation. Catches selector typos and unsupported fans BEFORE
+    // writing the plist, so launchd never enters a KeepAlive restart loop on an
+    // obviously bad config. Selector parse + range resolution happens before
+    // `read_fans()` so out-of-range and bad-shape errors short-circuit early.
+    let selector = parse_fan_selector(&fan)?;
+    let probe = msf_smc::probe()?;
+    let indices = selector.resolve(probe.fan_count)?;
+    let live = msf_smc::read_fans()?;
+    let _ctxs = build_fan_contexts(&indices, &probe, &live)?;
 
     let plist_path = PathBuf::from(PLIST_PATH);
     check_overwrite(&plist_path, force)?;
@@ -433,12 +496,18 @@ enum SetEvent<'a> {
     Tick {
         t: u64,
         max_temp_c: f64,
+        /// Post-clamp target for the first selected fan. Per-fan post-clamp values
+        /// can differ when fans report different `[Mn, Mx]` ranges; full per-fan
+        /// values are visible via `target_written` events (one per fan, first write).
         target_rpm: f64,
     },
     Rearm {
+        fan: u8,
         attempt: u32,
     },
-    RearmSuccess,
+    RearmSuccess {
+        fan: u8,
+    },
     Trip {
         sensor: &'a str,
         celsius: f64,
@@ -481,10 +550,10 @@ impl std::fmt::Debug for SetEvent<'_> {
                     "tick: t={t} max_temp_c={max_temp_c:.2} target_rpm={target_rpm:.0}"
                 )
             }
-            SetEvent::Rearm { attempt } => {
-                write!(f, "rearm: attempt={attempt}")
+            SetEvent::Rearm { fan, attempt } => {
+                write!(f, "rearm: fan={fan} attempt={attempt}")
             }
-            SetEvent::RearmSuccess => write!(f, "rearm_success"),
+            SetEvent::RearmSuccess { fan } => write!(f, "rearm_success: fan={fan}"),
             SetEvent::Trip { sensor, celsius } => {
                 write!(f, "TRIP: {sensor}={celsius:.1}°C")
             }
@@ -705,42 +774,32 @@ fn run_init(output: Option<PathBuf>, policy: Policy, force: bool) -> Result<()> 
 
     eprintln!("wrote {} ({} policy)", target_path.display(), policy.name());
     eprintln!(
-        "next:  sudo msf run --curve {} --fan 0 --duration-secs 600",
+        "next:  sudo msf run --curve {} --duration-secs 600",
         target_path.display()
     );
     Ok(())
 }
 
-fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Result<()> {
+fn run_curve(curve_path: PathBuf, fan: String, duration_secs: u64, json: bool) -> Result<()> {
     let is_root = unsafe { libc::geteuid() } == 0;
 
+    // Parse selector first so syntactically bad `--fan` values fail before any
+    // SMC contact (matches AC#3 ordering: parse → probe → resolve → read_fans).
+    let selector = parse_fan_selector(&fan)?;
     let curve = Curve::load(&curve_path)?;
 
     let probe = msf_smc::probe()?;
-    if fan >= probe.fan_count {
-        bail!(
-            "fan {fan} out of range (probe reports fan_count={})",
-            probe.fan_count
-        );
-    }
-    let fp = &probe.fans[fan as usize];
-    let (Some(md_info), Some(tg_info), Some(casing)) = (&fp.md, &fp.tg, fp.mode_key_casing) else {
-        bail!("fan {fan} not controllable: Md/Tg/casing missing in probe");
-    };
-
-    let fan_readings = msf_smc::read_fans()?;
-    let live = fan_readings
-        .iter()
-        .find(|f| f.index == fan)
-        .ok_or_else(|| anyhow::anyhow!("fan {fan} not found in read_fans"))?;
+    let indices = selector.resolve(probe.fan_count)?;
+    let live = msf_smc::read_fans()?;
+    let ctxs = build_fan_contexts(&indices, &probe, &live)?;
 
     if !is_root {
+        let indices_str: Vec<String> = ctxs.iter().map(|c| c.index.to_string()).collect();
         eprintln!(
-            "smoke OK: curve has {} points, fan {} controllable (Mn={:.0}/Mx={:.0}). Re-run with sudo to activate.",
+            "smoke OK: curve has {} points, {} fan(s) controllable [{}]. Re-run with sudo to activate.",
             curve.points.len(),
-            fan,
-            live.min_rpm,
-            live.max_rpm
+            ctxs.len(),
+            indices_str.join(", ")
         );
         return Ok(());
     }
@@ -766,22 +825,43 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
         ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))?;
     }
 
-    let mut session = ManualFanSession::arm(fan, casing, md_info)?;
-    emit_event(
-        json,
-        &SetEvent::Armed {
-            fan,
-            mode_key_type: &md_info.data_type,
-        },
-    );
+    // All-or-nothing arm: rollback already-armed sessions if any subsequent arm fails.
+    // Rollback restore failures are surfaced via eprintln so operators can see them
+    // even though the original arm error is what we return.
+    let mut sessions: Vec<ManualFanSession> = Vec::with_capacity(ctxs.len());
+    for c in &ctxs {
+        match ManualFanSession::arm(c.index, c.casing, c.md_info) {
+            Ok(s) => {
+                emit_event(
+                    json,
+                    &SetEvent::Armed {
+                        fan: c.index,
+                        mode_key_type: &c.md_info.data_type,
+                    },
+                );
+                sessions.push(s);
+            }
+            Err(e) => {
+                for (idx, s) in sessions.iter_mut().enumerate() {
+                    if !s.restore().unwrap_or(false) {
+                        eprintln!(
+                            "warning: arm rollback restore failed for fan {}",
+                            ctxs[idx].index
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
 
     let mut emas: HashMap<String, AsymmetricEma> = HashMap::new();
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
     let mut tripped: Option<(String, f64)> = None;
-    let mut target_written_emitted = false;
-    let mut consecutive_rearm_fails: u32 = 0;
+    let mut target_written_emitted: Vec<bool> = vec![false; sessions.len()];
+    let mut consecutive_rearm_fails: Vec<u32> = vec![0; sessions.len()];
 
-    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+    'outer: while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         let temps = msf_hid::read_all().unwrap_or_default();
 
         let mut raw_max = f64::NEG_INFINITY;
@@ -816,18 +896,28 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
         }
 
         let raw_target = curve.evaluate(ema_max);
-        let target = clamp_rpm(raw_target, live.min_rpm, live.max_rpm);
-        session.write_target(tg_info, target)?;
 
-        if !target_written_emitted {
-            emit_event(
-                json,
-                &SetEvent::TargetWritten {
-                    fan,
-                    target_rpm: target,
-                },
-            );
-            target_written_emitted = true;
+        // Per-fan write with per-fan clamp. First successful write per fan emits
+        // a `target_written` event with the post-clamp value. The first fan's
+        // post-clamp target is also reported on the per-tick `tick` event.
+        let mut tick_target: Option<f64> = None;
+        for (i, session) in sessions.iter_mut().enumerate() {
+            let c = &ctxs[i];
+            let target = clamp_rpm(raw_target, c.min_rpm, c.max_rpm);
+            session.write_target(c.tg_info, target)?;
+            if tick_target.is_none() {
+                tick_target = Some(target);
+            }
+            if !target_written_emitted[i] {
+                emit_event(
+                    json,
+                    &SetEvent::TargetWritten {
+                        fan: c.index,
+                        target_rpm: target,
+                    },
+                );
+                target_written_emitted[i] = true;
+            }
         }
 
         emit_event(
@@ -835,40 +925,49 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
             &SetEvent::Tick {
                 t: now_ms(),
                 max_temp_c: ema_max,
-                target_rpm: target,
+                target_rpm: tick_target.unwrap_or(raw_target),
             },
         );
 
-        // Drift detection: if F{N}Md has fallen back to 0 (sleep/wake firmware reset,
-        // thermalmonitord override, etc), re-arm via the same direct-mode write path.
-        // SMC read errors are treated as drift attempts so a stale handle after sleep
-        // wakes the 3-strike escalation rather than silently looping.
-        let drift_detected = match session.read_mode() {
-            Ok(mode) => mode < 0.5,
-            Err(_) => true,
-        };
-        if drift_detected {
-            let attempt = consecutive_rearm_fails + 1;
-            emit_event(json, &SetEvent::Rearm { attempt });
+        // Per-fan drift detection: each fan's F{N}Md readback drives an independent
+        // 3-strike counter. Any fan's 3rd consecutive re-arm failure trips the whole
+        // loop (conservative — losing track of one fan during a hot loop is exactly
+        // when you want pessimism over limping along with half a working setup).
+        for (i, session) in sessions.iter_mut().enumerate() {
+            let c = &ctxs[i];
+            let drift_detected = match session.read_mode() {
+                Ok(mode) => mode < 0.5,
+                Err(_) => true,
+            };
+            if !drift_detected {
+                consecutive_rearm_fails[i] = 0;
+                continue;
+            }
+            let attempt = consecutive_rearm_fails[i] + 1;
+            emit_event(
+                json,
+                &SetEvent::Rearm {
+                    fan: c.index,
+                    attempt,
+                },
+            );
             let outcome = match session.re_arm() {
-                Ok(success) => handle_drift_outcome(success, consecutive_rearm_fails),
-                Err(_) => handle_drift_outcome(false, consecutive_rearm_fails),
+                Ok(success) => handle_drift_outcome(success, consecutive_rearm_fails[i]),
+                Err(_) => handle_drift_outcome(false, consecutive_rearm_fails[i]),
             };
             match outcome {
                 DriftOutcome::Recovered => {
-                    emit_event(json, &SetEvent::RearmSuccess);
-                    consecutive_rearm_fails = 0;
+                    emit_event(json, &SetEvent::RearmSuccess { fan: c.index });
+                    consecutive_rearm_fails[i] = 0;
                 }
                 DriftOutcome::Retry { attempt: _ } => {
-                    consecutive_rearm_fails += 1;
+                    consecutive_rearm_fails[i] += 1;
                 }
                 DriftOutcome::Trip => {
                     tripped = Some((REARM_SENTINEL.to_string(), f64::NAN));
-                    break;
+                    break 'outer;
                 }
             }
-        } else {
-            consecutive_rearm_fails = 0;
         }
 
         std::thread::sleep(Duration::from_secs(1));
@@ -885,7 +984,12 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
     }
 
     emit_event(json, &SetEvent::RestoreStarted);
-    let restore_ok = session.restore().unwrap_or(false);
+    let mut restore_ok = true;
+    for s in sessions.iter_mut() {
+        if !s.restore().unwrap_or(false) {
+            restore_ok = false;
+        }
+    }
     if restore_ok {
         emit_event(json, &SetEvent::RestoreDone);
     } else {
@@ -1195,7 +1299,7 @@ mod tests {
         let cfg = PlistConfig {
             binary: PathBuf::from("/usr/local/bin/msf"),
             curve: PathBuf::from("/etc/msf/profile.toml"),
-            fan: 0,
+            fan: "all".to_string(),
         };
         let body = render_plist(&cfg).unwrap();
         let value = plist::Value::from_reader(std::io::Cursor::new(&body)).unwrap();
@@ -1209,7 +1313,7 @@ mod tests {
         assert_eq!(args[2].as_string().unwrap(), "--curve");
         assert_eq!(args[3].as_string().unwrap(), "/etc/msf/profile.toml");
         assert_eq!(args[4].as_string().unwrap(), "--fan");
-        assert_eq!(args[5].as_string().unwrap(), "0");
+        assert_eq!(args[5].as_string().unwrap(), "all");
         assert_eq!(args[6].as_string().unwrap(), "--duration-secs");
         assert_eq!(
             args[7].as_string().unwrap(),
@@ -1218,11 +1322,30 @@ mod tests {
     }
 
     #[test]
+    fn render_plist_preserves_csv_selector_verbatim() {
+        let cfg = PlistConfig {
+            binary: PathBuf::from("/usr/local/bin/msf"),
+            curve: PathBuf::from("/etc/msf/profile.toml"),
+            fan: "0,1".to_string(),
+        };
+        let body = render_plist(&cfg).unwrap();
+        let value = plist::Value::from_reader(std::io::Cursor::new(&body)).unwrap();
+        let args = value
+            .as_dictionary()
+            .unwrap()
+            .get("ProgramArguments")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(args[5].as_string().unwrap(), "0,1");
+    }
+
+    #[test]
     fn parse_curve_path_extracts_curve_arg() {
         let cfg = PlistConfig {
             binary: PathBuf::from("/usr/local/bin/msf"),
             curve: PathBuf::from("/etc/msf/profile.toml"),
-            fan: 1,
+            fan: "1".to_string(),
         };
         let body = render_plist(&cfg).unwrap();
         let p = std::env::temp_dir().join(format!("msf-plist-{}.plist", std::process::id()));
