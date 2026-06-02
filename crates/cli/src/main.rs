@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use msf_core::{Reading, SensorSource};
+use msf_core::{Calibration, Host, Reading, SensorSource};
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -16,7 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print sensor + fan readings (read-only, no sudo needed)
+    /// Print sensor + fan readings (read-only, no sudo)
     Monitor {
         #[arg(long)]
         json: bool,
@@ -26,7 +27,26 @@ enum Command {
 
         #[arg(long, default_value_t = 0)]
         ticks: u32,
+
+        /// Restrict output to sensors in the calibration allowlist
+        #[arg(long)]
+        selected: bool,
     },
+    /// Manage the per-host sensor allowlist
+    Calibrate {
+        #[command(subcommand)]
+        action: CalibrateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalibrateAction {
+    /// Add a sensor name to the allowlist (idempotent)
+    Add { name: String },
+    /// Remove a sensor from the allowlist (idempotent)
+    Remove { name: String },
+    /// Show the current allowlist and host key
+    List,
 }
 
 fn main() -> Result<()> {
@@ -48,8 +68,50 @@ fn main() -> Result<()> {
             json,
             interval_secs,
             ticks,
-        } => run_monitor(json, interval_secs, ticks),
+            selected,
+        } => run_monitor(json, interval_secs, ticks, selected),
+        Command::Calibrate { action } => run_calibrate(action),
     }
+}
+
+fn run_calibrate(action: CalibrateAction) -> Result<()> {
+    let host = Host::detect()?;
+    let mut cal = Calibration::load()?.unwrap_or_else(|| Calibration::for_host(&host));
+
+    match action {
+        CalibrateAction::Add { name } => {
+            if cal.add(&name) {
+                cal.save()?;
+                eprintln!("added: {name}");
+            } else {
+                eprintln!("already present: {name}");
+            }
+        }
+        CalibrateAction::Remove { name } => {
+            if cal.remove(&name) {
+                cal.save()?;
+                eprintln!("removed: {name}");
+            } else {
+                eprintln!("not present: {name}");
+            }
+        }
+        CalibrateAction::List => {
+            println!("model:       {}", cal.model);
+            println!("build:       {}", cal.build);
+            println!("recorded_at: {}", cal.recorded_at);
+            println!("sensors ({}):", cal.sensors.len());
+            for (name, entry) in &cal.sensors {
+                println!("  - {name} (added {})", entry.added_at);
+            }
+            if !cal.matches_host(&host) {
+                eprintln!(
+                    "warning: calibration host mismatch (current: {}/{}, recorded: {}/{})",
+                    host.model, host.build, cal.model, cal.build
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -110,18 +172,21 @@ fn collect_readings() -> Vec<Reading> {
     out
 }
 
-fn run_monitor(json: bool, interval_secs: f64, ticks: u32) -> Result<()> {
+fn run_monitor(json: bool, interval_secs: f64, ticks: u32, selected: bool) -> Result<()> {
+    let filter: Option<HashSet<String>> = if selected {
+        match Calibration::load()? {
+            None => bail!("no calibration found; run `msf calibrate add <sensor>` first"),
+            Some(c) => Some(c.sensors.into_keys().collect()),
+        }
+    } else {
+        None
+    };
+
     let interval = Duration::from_secs_f64(interval_secs.max(0.05));
     let mut count = 0u32;
     loop {
         let readings = collect_readings();
-        if json {
-            for r in &readings {
-                println!("{}", serde_json::to_string(r)?);
-            }
-        } else {
-            print_table(&readings);
-        }
+        emit(&readings, &filter, json)?;
         count += 1;
         if ticks > 0 && count >= ticks {
             return Ok(());
@@ -130,22 +195,40 @@ fn run_monitor(json: bool, interval_secs: f64, ticks: u32) -> Result<()> {
     }
 }
 
-fn print_table(readings: &[Reading]) {
-    println!("{:<44} {:>4} {:>10} {:>5}", "name", "src", "value", "unit");
-    for r in readings {
-        let src = match r.source {
-            SensorSource::Hid => "HID",
-            SensorSource::Smc => "SMC",
-        };
-        println!(
-            "{:<44} {:>4} {:>10.2} {:>5}",
-            truncate(&r.name, 44),
-            src,
-            r.value,
-            r.unit
-        );
+fn emit(readings: &[Reading], filter: &Option<HashSet<String>>, json: bool) -> Result<()> {
+    let pass = |r: &Reading| filter.as_ref().is_none_or(|allow| allow.contains(&r.name));
+
+    if !json {
+        println!("{:<44} {:>4} {:>10} {:>5}", "name", "src", "value", "unit");
     }
-    println!();
+    for r in readings {
+        if !pass(r) {
+            continue;
+        }
+        if json {
+            println!("{}", serde_json::to_string(r)?);
+        } else {
+            print_row(r);
+        }
+    }
+    if !json {
+        println!();
+    }
+    Ok(())
+}
+
+fn print_row(r: &Reading) {
+    let src = match r.source {
+        SensorSource::Hid => "HID",
+        SensorSource::Smc => "SMC",
+    };
+    println!(
+        "{:<44} {:>4} {:>10.2} {:>5}",
+        truncate(&r.name, 44),
+        src,
+        r.value,
+        r.unit
+    );
 }
 
 fn truncate(s: &str, max: usize) -> &str {
