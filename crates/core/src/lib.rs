@@ -64,7 +64,11 @@ impl Calibration {
     }
 
     pub fn load() -> Result<Option<Self>> {
-        let path = config_path()?;
+        // No HOME / XDG_CONFIG_HOME is a "no calibration" condition, not an error —
+        // e.g. when running as a launchd daemon. Caller treats None as degraded fallback.
+        let Ok(path) = config_path() else {
+            return Ok(None);
+        };
         if !path.exists() {
             return Ok(None);
         }

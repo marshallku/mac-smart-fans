@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use msf_core::{
     AsymmetricEma, Calibration, Curve, FanSpec, Host, Policy, Reading, SensorSource,
@@ -7,7 +7,7 @@ use msf_core::{
 use msf_smc::{FanProbe, KeyInfo, ManualFanSession};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -93,6 +93,28 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Install msf as a launchd LaunchDaemon that runs the curve loop persistently (root required)
+    Install {
+        /// Curve TOML to bind into the plist
+        #[arg(long)]
+        curve: PathBuf,
+        /// Fan index for the daemon to control
+        #[arg(long, default_value_t = 0)]
+        fan: u8,
+        /// Override binary path (default: current_exe() with /usr/local/bin/msf fallback)
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Overwrite an existing plist
+        #[arg(long)]
+        force: bool,
+    },
+    /// Uninstall the launchd daemon (root required)
+    Uninstall,
+    /// Report whether the daemon plist is installed and loaded (no root)
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -163,7 +185,238 @@ fn main() -> Result<()> {
             duration_secs,
             json,
         } => run_curve(curve, fan, duration_secs, json),
+        Command::Install {
+            curve,
+            fan,
+            binary,
+            force,
+        } => run_install(curve, fan, binary, force),
+        Command::Uninstall => run_uninstall(),
+        Command::Status { json } => run_status(json),
     }
+}
+
+const DAEMON_LABEL: &str = "im.toss.mac-smart-fans";
+const PLIST_PATH: &str = "/Library/LaunchDaemons/im.toss.mac-smart-fans.plist";
+const LOG_DIR: &str = "/var/log/msf";
+const DAEMON_DURATION_SECS: u64 = 31_536_000; // one year
+
+struct PlistConfig {
+    binary: PathBuf,
+    curve: PathBuf,
+    fan: u8,
+}
+
+fn render_plist(cfg: &PlistConfig) -> Result<Vec<u8>> {
+    let mut dict = plist::Dictionary::new();
+    dict.insert("Label".into(), plist::Value::String(DAEMON_LABEL.into()));
+    dict.insert(
+        "ProgramArguments".into(),
+        plist::Value::Array(vec![
+            cfg.binary.display().to_string().into(),
+            "run".into(),
+            "--curve".into(),
+            cfg.curve.display().to_string().into(),
+            "--fan".into(),
+            cfg.fan.to_string().into(),
+            "--duration-secs".into(),
+            DAEMON_DURATION_SECS.to_string().into(),
+        ]),
+    );
+    dict.insert("RunAtLoad".into(), plist::Value::Boolean(true));
+    dict.insert("KeepAlive".into(), plist::Value::Boolean(true));
+    dict.insert(
+        "StandardOutPath".into(),
+        plist::Value::String(format!("{LOG_DIR}/stdout.log")),
+    );
+    dict.insert(
+        "StandardErrorPath".into(),
+        plist::Value::String(format!("{LOG_DIR}/stderr.log")),
+    );
+    let mut buf = Vec::new();
+    plist::to_writer_xml(&mut buf, &plist::Value::Dictionary(dict))?;
+    Ok(buf)
+}
+
+fn resolve_binary_with<F: Fn() -> Option<PathBuf>>(arg: Option<PathBuf>, current: F) -> PathBuf {
+    arg.or_else(current)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/bin/msf"))
+}
+
+fn resolve_binary(arg: Option<PathBuf>) -> PathBuf {
+    resolve_binary_with(arg, || std::env::current_exe().ok())
+}
+
+fn parse_curve_path_from_plist(path: &Path) -> Result<PathBuf> {
+    let value = plist::Value::from_file(path)?;
+    let dict = value
+        .as_dictionary()
+        .ok_or_else(|| anyhow!("plist root is not a dictionary"))?;
+    let args = dict
+        .get("ProgramArguments")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("plist missing ProgramArguments array"))?;
+    let mut iter = args.iter();
+    while let Some(v) = iter.next() {
+        if v.as_string() == Some("--curve")
+            && let Some(next) = iter.next().and_then(|v| v.as_string())
+        {
+            return Ok(PathBuf::from(next));
+        }
+    }
+    Err(anyhow!("plist ProgramArguments has no --curve flag"))
+}
+
+fn run_install(
+    curve: PathBuf,
+    fan: u8,
+    binary: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("msf install requires root (writes /Library/LaunchDaemons/). Re-run with sudo.");
+        std::process::exit(2);
+    }
+
+    let plist_path = PathBuf::from(PLIST_PATH);
+    check_overwrite(&plist_path, force)?;
+
+    let abs_curve = curve
+        .canonicalize()
+        .map_err(|e| anyhow!("curve path: {e} ({})", curve.display()))?;
+    let binary_path = resolve_binary(binary);
+
+    let cfg = PlistConfig {
+        binary: binary_path,
+        curve: abs_curve,
+        fan,
+    };
+    let body = render_plist(&cfg)?;
+
+    std::fs::create_dir_all(LOG_DIR)?;
+    use std::os::unix::fs::PermissionsExt;
+    let mut log_perms = std::fs::metadata(LOG_DIR)?.permissions();
+    log_perms.set_mode(0o755);
+    std::fs::set_permissions(LOG_DIR, log_perms)?;
+    // explicit chown root:wheel — covers pre-existing dirs with wrong owner and the
+    // egid != 0 edge case codex round 2 flagged.
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(std::path::Path::new(LOG_DIR).as_os_str().as_bytes())
+            .map_err(|e| anyhow!("CString: {e}"))?;
+        let rc = unsafe { libc::chown(c.as_ptr(), 0, 0) };
+        if rc != 0 {
+            return Err(anyhow!(
+                "chown {LOG_DIR}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    if plist_path.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("system/{DAEMON_LABEL}")])
+            .status();
+    }
+
+    std::fs::write(&plist_path, body)?;
+    let mut perms = std::fs::metadata(&plist_path)?.permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&plist_path, perms)?;
+
+    let bootstrap_status = std::process::Command::new("launchctl")
+        .args(["bootstrap", "system", PLIST_PATH])
+        .status()?;
+    if !bootstrap_status.success() {
+        let load_status = std::process::Command::new("launchctl")
+            .args(["load", PLIST_PATH])
+            .status()?;
+        if !load_status.success() {
+            bail!("both `launchctl bootstrap` and `launchctl load` failed");
+        }
+    }
+
+    eprintln!("installed and loaded: {}", plist_path.display());
+    eprintln!("logs:                  {LOG_DIR}/{{stdout,stderr}}.log");
+    eprintln!("check:                 msf status");
+    Ok(())
+}
+
+fn run_uninstall() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!(
+            "msf uninstall requires root (removes /Library/LaunchDaemons/). Re-run with sudo."
+        );
+        std::process::exit(2);
+    }
+    let plist_path = PathBuf::from(PLIST_PATH);
+
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("system/{DAEMON_LABEL}")])
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", PLIST_PATH])
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if plist_path.exists() {
+        std::fs::remove_file(&plist_path)?;
+        eprintln!("removed: {}", plist_path.display());
+    } else {
+        eprintln!("(already absent: {})", plist_path.display());
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct StatusReport {
+    plist_present: bool,
+    loaded: bool,
+    curve_path: Option<String>,
+}
+
+fn run_status(json: bool) -> Result<()> {
+    let plist_path = PathBuf::from(PLIST_PATH);
+    let plist_present = plist_path.exists();
+    let curve_path = if plist_present {
+        parse_curve_path_from_plist(&plist_path)
+            .ok()
+            .map(|p| p.display().to_string())
+    } else {
+        None
+    };
+    let loaded = std::process::Command::new("launchctl")
+        .args(["print", &format!("system/{DAEMON_LABEL}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let report = StatusReport {
+        plist_present,
+        loaded,
+        curve_path,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "plist:  {} ({})",
+            PLIST_PATH,
+            if report.plist_present {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!("loaded: {}", report.loaded);
+        if let Some(c) = &report.curve_path {
+            println!("curve:  {c}");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -857,5 +1110,78 @@ fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((i, _)) => &s[..i],
         None => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_plist_round_trips_through_parser() {
+        let cfg = PlistConfig {
+            binary: PathBuf::from("/usr/local/bin/msf"),
+            curve: PathBuf::from("/etc/msf/profile.toml"),
+            fan: 0,
+        };
+        let body = render_plist(&cfg).unwrap();
+        let value = plist::Value::from_reader(std::io::Cursor::new(&body)).unwrap();
+        let dict = value.as_dictionary().unwrap();
+        assert_eq!(dict.get("Label").unwrap().as_string(), Some(DAEMON_LABEL));
+        assert_eq!(dict.get("RunAtLoad").unwrap().as_boolean(), Some(true));
+        assert_eq!(dict.get("KeepAlive").unwrap().as_boolean(), Some(true));
+        let args = dict.get("ProgramArguments").unwrap().as_array().unwrap();
+        assert_eq!(args[0].as_string().unwrap(), "/usr/local/bin/msf");
+        assert_eq!(args[1].as_string().unwrap(), "run");
+        assert_eq!(args[2].as_string().unwrap(), "--curve");
+        assert_eq!(args[3].as_string().unwrap(), "/etc/msf/profile.toml");
+        assert_eq!(args[4].as_string().unwrap(), "--fan");
+        assert_eq!(args[5].as_string().unwrap(), "0");
+        assert_eq!(args[6].as_string().unwrap(), "--duration-secs");
+        assert_eq!(
+            args[7].as_string().unwrap(),
+            DAEMON_DURATION_SECS.to_string()
+        );
+    }
+
+    #[test]
+    fn parse_curve_path_extracts_curve_arg() {
+        let cfg = PlistConfig {
+            binary: PathBuf::from("/usr/local/bin/msf"),
+            curve: PathBuf::from("/etc/msf/profile.toml"),
+            fan: 1,
+        };
+        let body = render_plist(&cfg).unwrap();
+        let p = std::env::temp_dir().join(format!("msf-plist-{}.plist", std::process::id()));
+        std::fs::write(&p, &body).unwrap();
+        let recovered = parse_curve_path_from_plist(&p).unwrap();
+        assert_eq!(recovered, PathBuf::from("/etc/msf/profile.toml"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn resolve_binary_uses_arg_when_given() {
+        let p = PathBuf::from("/custom/msf");
+        assert_eq!(resolve_binary(Some(p.clone())), p);
+    }
+
+    #[test]
+    fn resolve_binary_with_uses_current_when_arg_is_none() {
+        let v = resolve_binary_with(None, || Some(PathBuf::from("/cur/msf")));
+        assert_eq!(v, PathBuf::from("/cur/msf"));
+    }
+
+    #[test]
+    fn resolve_binary_with_falls_back_when_current_fails() {
+        let v = resolve_binary_with(None, || None);
+        assert_eq!(v, PathBuf::from("/usr/local/bin/msf"));
+    }
+
+    #[test]
+    fn resolve_binary_with_prefers_arg_over_current() {
+        let v = resolve_binary_with(Some(PathBuf::from("/arg/msf")), || {
+            Some(PathBuf::from("/cur/msf"))
+        });
+        assert_eq!(v, PathBuf::from("/arg/msf"));
     }
 }
