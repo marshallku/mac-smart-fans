@@ -460,11 +460,18 @@ impl ManualFanSession {
         }
         let fcc = fourcc_from_str(&self.mode_type)?;
         let payload = encode_zero(&self.mode_type, self.mode_size)?;
-        self.smc.write_key(self.mode_key, fcc, &payload)?;
-        let (rb_info, rb_bytes) = self.smc.read_key(self.mode_key)?;
-        let rb = decode_numeric(&rb_info, &rb_bytes).unwrap_or(1.0);
-        self.restored = rb < 0.5;
-        Ok(self.restored)
+
+        for _ in 0..3 {
+            self.smc.write_key(self.mode_key, fcc, &payload)?;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let (rb_info, rb_bytes) = self.smc.read_key(self.mode_key)?;
+            let rb = decode_numeric(&rb_info, &rb_bytes).unwrap_or(1.0);
+            if rb < 0.5 {
+                self.restored = true;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn fan_index(&self) -> u8 {
