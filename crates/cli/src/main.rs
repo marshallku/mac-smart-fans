@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use msf_core::{Calibration, Host, Reading, SensorSource};
+use msf_smc::{FanProbe, KeyInfo};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +39,11 @@ enum Command {
         #[command(subcommand)]
         action: CalibrateAction,
     },
+    /// Read-only SMC capability discovery (no writes)
+    Probe {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,6 +78,119 @@ fn main() -> Result<()> {
             selected,
         } => run_monitor(json, interval_secs, ticks, selected),
         Command::Calibrate { action } => run_calibrate(action),
+        Command::Probe { json } => run_probe(json),
+    }
+}
+
+#[derive(Serialize)]
+struct ProbeSummary {
+    model: String,
+    build: String,
+    fan_count: u8,
+    ftst: FtstField,
+    fans: Vec<FanProbe>,
+    controllable: bool,
+    not_controllable_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FtstField {
+    present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_attributes: Option<u8>,
+}
+
+impl From<Option<KeyInfo>> for FtstField {
+    fn from(k: Option<KeyInfo>) -> Self {
+        match k {
+            None => Self {
+                present: false,
+                data_type: None,
+                data_size: None,
+                data_attributes: None,
+            },
+            Some(k) => Self {
+                present: true,
+                data_type: Some(k.data_type),
+                data_size: Some(k.data_size),
+                data_attributes: Some(k.data_attributes),
+            },
+        }
+    }
+}
+
+fn run_probe(json: bool) -> Result<()> {
+    let host = Host::detect()?;
+    let probe = msf_smc::probe()?;
+    let reason = probe.not_controllable_reason();
+    let summary = ProbeSummary {
+        model: host.model,
+        build: host.build,
+        fan_count: probe.fan_count,
+        ftst: probe.ftst.into(),
+        fans: probe.fans,
+        controllable: reason.is_none(),
+        not_controllable_reason: reason,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&summary)?);
+    } else {
+        print_probe(&summary);
+    }
+    Ok(())
+}
+
+fn print_probe(s: &ProbeSummary) {
+    println!("model:       {}", s.model);
+    println!("build:       {}", s.build);
+    println!("fan_count:   {}", s.fan_count);
+    if s.ftst.present {
+        println!(
+            "ftst:        present (type={:?}, size={}, attrs=0x{:02x})",
+            s.ftst.data_type.as_deref().unwrap_or("?"),
+            s.ftst.data_size.unwrap_or(0),
+            s.ftst.data_attributes.unwrap_or(0),
+        );
+    } else {
+        println!("ftst:        ABSENT");
+    }
+    for fan in &s.fans {
+        println!();
+        println!("fan #{}:", fan.index);
+        let casing = match fan.mode_key_casing {
+            Some(msf_smc::ModeKeyCasing::Upper) => "F{N}Md (uppercase)",
+            Some(msf_smc::ModeKeyCasing::Lower) => "F{N}md (lowercase)",
+            None => "NONE",
+        };
+        println!("  mode key casing: {casing}");
+        print_key("Md", &fan.md);
+        print_key("Tg", &fan.tg);
+        print_key("Mn", &fan.mn);
+        print_key("Mx", &fan.mx);
+    }
+    println!();
+    println!(
+        "controllable: {}{}",
+        s.controllable,
+        s.not_controllable_reason
+            .as_deref()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default(),
+    );
+}
+
+fn print_key(label: &str, k: &Option<KeyInfo>) {
+    match k {
+        Some(k) => println!(
+            "  {label}: type={:?} size={} attrs=0x{:02x}",
+            k.data_type, k.data_size, k.data_attributes
+        ),
+        None => println!("  {label}: ABSENT"),
     }
 }
 

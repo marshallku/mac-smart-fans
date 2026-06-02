@@ -326,6 +326,7 @@ dependencies = [
  "msf-core",
  "msf-hid",
  "msf-smc",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -361,6 +362,7 @@ dependencies = [
  "anyhow",
  "core-foundation-sys",
  "libc",
+ "serde",
  "tracing",
 ]
 

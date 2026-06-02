@@ -10,6 +10,7 @@
 
 use anyhow::{Result, anyhow};
 use core_foundation_sys::dictionary::{CFDictionaryRef, CFMutableDictionaryRef};
+use serde::{Deserialize, Serialize};
 use std::ffi::{CString, c_char, c_void};
 use std::mem::{MaybeUninit, size_of};
 
@@ -19,6 +20,61 @@ pub struct FanReading {
     pub actual_rpm: f64,
     pub min_rpm: f64,
     pub max_rpm: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub data_type: String,
+    pub data_size: u32,
+    pub data_attributes: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModeKeyCasing {
+    Upper,
+    Lower,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanProbe {
+    pub index: u8,
+    pub mode_key_casing: Option<ModeKeyCasing>,
+    pub md: Option<KeyInfo>,
+    pub tg: Option<KeyInfo>,
+    pub mn: Option<KeyInfo>,
+    pub mx: Option<KeyInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Probe {
+    pub fan_count: u8,
+    pub ftst: Option<KeyInfo>,
+    pub fans: Vec<FanProbe>,
+}
+
+impl Probe {
+    pub fn not_controllable_reason(&self) -> Option<String> {
+        if self.fan_count == 0 {
+            return Some("fan_count == 0".to_string());
+        }
+        if self.ftst.is_none() {
+            return Some("Ftst key missing".to_string());
+        }
+        for fan in &self.fans {
+            if fan.md.is_none() {
+                return Some(format!("F{i}Md and F{i}md both missing", i = fan.index));
+            }
+            if fan.tg.is_none() {
+                return Some(format!("F{}Tg missing", fan.index));
+            }
+        }
+        None
+    }
+
+    pub fn controllable(&self) -> bool {
+        self.not_controllable_reason().is_none()
+    }
 }
 
 type KernReturn = i32;
@@ -166,6 +222,17 @@ impl SmcConnection {
         Ok(out)
     }
 
+    fn read_key_info(&self, key: u32) -> Option<KeyInfo> {
+        let out = self
+            .call(&SmcKeyData {
+                key,
+                data8: SMC_CMD_READ_KEYINFO,
+                ..Default::default()
+            })
+            .ok()?;
+        Some(key_info_from_raw(&out.key_info))
+    }
+
     fn read_key(&self, key: u32) -> Result<(SmcKeyDataKeyInfo, [u8; 32])> {
         let info_out = self.call(&SmcKeyData {
             key,
@@ -209,6 +276,61 @@ fn decode_numeric(info: &SmcKeyDataKeyInfo, bytes: &[u8; 32]) -> Option<f64> {
         ),
         _ => None,
     }
+}
+
+fn fourcc_to_string(t: u32) -> String {
+    String::from_utf8_lossy(&t.to_be_bytes()).into_owned()
+}
+
+fn key_info_from_raw(raw: &SmcKeyDataKeyInfo) -> KeyInfo {
+    KeyInfo {
+        data_type: fourcc_to_string(raw.data_type),
+        data_size: raw.data_size,
+        data_attributes: raw.data_attributes,
+    }
+}
+
+pub fn select_mode_casing(
+    upper: Option<KeyInfo>,
+    lower: Option<KeyInfo>,
+) -> (Option<ModeKeyCasing>, Option<KeyInfo>) {
+    match (upper, lower) {
+        (Some(k), _) => (Some(ModeKeyCasing::Upper), Some(k)),
+        (None, Some(k)) => (Some(ModeKeyCasing::Lower), Some(k)),
+        (None, None) => (None, None),
+    }
+}
+
+const KEY_FTST: u32 = fourcc(b"Ftst");
+
+pub fn probe() -> Result<Probe> {
+    let smc = SmcConnection::open()?;
+    let (count_info, count_bytes) = smc.read_key(KEY_FNUM)?;
+    let count = decode_numeric(&count_info, &count_bytes).unwrap_or(0.0) as u8;
+
+    let ftst = smc.read_key_info(KEY_FTST);
+
+    let mut fans = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let md_upper = smc.read_key_info(fan_key(i, b"Md"));
+        let md_lower = smc.read_key_info(fan_key(i, b"md"));
+        let (mode_key_casing, md) = select_mode_casing(md_upper, md_lower);
+
+        fans.push(FanProbe {
+            index: i,
+            mode_key_casing,
+            md,
+            tg: smc.read_key_info(fan_key(i, b"Tg")),
+            mn: smc.read_key_info(fan_key(i, b"Mn")),
+            mx: smc.read_key_info(fan_key(i, b"Mx")),
+        });
+    }
+
+    Ok(Probe {
+        fan_count: count,
+        ftst,
+        fans,
+    })
 }
 
 pub fn read_fans() -> Result<Vec<FanReading>> {
@@ -302,5 +424,141 @@ mod tests {
         let info = info_of(b"unkn", 4);
         let bytes = [0u8; 32];
         assert!(decode_numeric(&info, &bytes).is_none());
+    }
+
+    #[test]
+    fn fourcc_to_string_pads_with_space() {
+        assert_eq!(fourcc_to_string(fourcc(b"flt ")), "flt ");
+        assert_eq!(fourcc_to_string(fourcc(b"ui8 ")), "ui8 ");
+        assert_eq!(fourcc_to_string(fourcc(b"F0Md")), "F0Md");
+    }
+
+    fn key(t: &str, sz: u32) -> KeyInfo {
+        KeyInfo {
+            data_type: t.to_string(),
+            data_size: sz,
+            data_attributes: 0,
+        }
+    }
+
+    #[test]
+    fn probe_controllable_when_all_keys_present() {
+        let p = Probe {
+            fan_count: 2,
+            ftst: Some(key("ui8 ", 1)),
+            fans: vec![
+                FanProbe {
+                    index: 0,
+                    mode_key_casing: Some(ModeKeyCasing::Upper),
+                    md: Some(key("ui8 ", 1)),
+                    tg: Some(key("flt ", 4)),
+                    mn: Some(key("flt ", 4)),
+                    mx: Some(key("flt ", 4)),
+                },
+                FanProbe {
+                    index: 1,
+                    mode_key_casing: Some(ModeKeyCasing::Upper),
+                    md: Some(key("ui8 ", 1)),
+                    tg: Some(key("flt ", 4)),
+                    mn: Some(key("flt ", 4)),
+                    mx: Some(key("flt ", 4)),
+                },
+            ],
+        };
+        assert!(p.controllable());
+        assert_eq!(p.not_controllable_reason(), None);
+    }
+
+    #[test]
+    fn probe_not_controllable_when_ftst_missing() {
+        let p = Probe {
+            fan_count: 1,
+            ftst: None,
+            fans: vec![FanProbe {
+                index: 0,
+                mode_key_casing: Some(ModeKeyCasing::Upper),
+                md: Some(key("ui8 ", 1)),
+                tg: Some(key("flt ", 4)),
+                mn: None,
+                mx: None,
+            }],
+        };
+        assert!(!p.controllable());
+        assert_eq!(p.not_controllable_reason().as_deref(), Some("Ftst key missing"));
+    }
+
+    #[test]
+    fn probe_not_controllable_when_fan_count_zero() {
+        let p = Probe {
+            fan_count: 0,
+            ftst: Some(key("ui8 ", 1)),
+            fans: vec![],
+        };
+        assert!(!p.controllable());
+        assert_eq!(p.not_controllable_reason().as_deref(), Some("fan_count == 0"));
+    }
+
+    #[test]
+    fn key_info_from_raw_preserves_all_fields() {
+        let raw = SmcKeyDataKeyInfo {
+            data_type: fourcc(b"flt "),
+            data_size: 4,
+            data_attributes: 0xd4,
+        };
+        let info = key_info_from_raw(&raw);
+        assert_eq!(info.data_type, "flt ");
+        assert_eq!(info.data_size, 4);
+        assert_eq!(info.data_attributes, 0xd4);
+    }
+
+    #[test]
+    fn select_mode_casing_prefers_upper_when_both_present() {
+        let u = key("ui8 ", 1);
+        let l = KeyInfo {
+            data_type: "ui8 ".to_string(),
+            data_size: 1,
+            data_attributes: 0,
+        };
+        let (casing, info) = select_mode_casing(Some(u.clone()), Some(l));
+        assert_eq!(casing, Some(ModeKeyCasing::Upper));
+        assert_eq!(info, Some(u));
+    }
+
+    #[test]
+    fn select_mode_casing_falls_back_to_lower() {
+        let l = key("ui8 ", 1);
+        let (casing, info) = select_mode_casing(None, Some(l.clone()));
+        assert_eq!(casing, Some(ModeKeyCasing::Lower));
+        assert_eq!(info, Some(l));
+    }
+
+    #[test]
+    fn select_mode_casing_none_when_both_absent() {
+        let (casing, info) = select_mode_casing(None, None);
+        assert_eq!(casing, None);
+        assert_eq!(info, None);
+    }
+
+    #[test]
+    fn probe_not_controllable_when_md_missing() {
+        let p = Probe {
+            fan_count: 1,
+            ftst: Some(key("ui8 ", 1)),
+            fans: vec![FanProbe {
+                index: 0,
+                mode_key_casing: None,
+                md: None,
+                tg: Some(key("flt ", 4)),
+                mn: None,
+                mx: None,
+            }],
+        };
+        assert!(!p.controllable());
+        assert!(
+            p.not_controllable_reason()
+                .as_deref()
+                .unwrap()
+                .contains("F0Md")
+        );
     }
 }

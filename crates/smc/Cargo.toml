@@ -10,4 +10,5 @@ repository.workspace = true
 anyhow.workspace = true
 core-foundation-sys.workspace = true
 libc.workspace = true
+serde.workspace = true
 tracing.workspace = true
