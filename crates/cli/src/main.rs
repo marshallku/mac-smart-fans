@@ -1,6 +1,9 @@
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
-use msf_core::{AsymmetricEma, Calibration, Curve, Host, Reading, SensorSource, clamp_rpm};
+use clap::{Parser, Subcommand, ValueEnum};
+use msf_core::{
+    AsymmetricEma, Calibration, Curve, FanSpec, Host, Policy, Reading, SensorSource,
+    check_overwrite, clamp_rpm, profile_path, render_profile,
+};
 use msf_smc::{FanProbe, KeyInfo, ManualFanSession};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -63,6 +66,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Generate a starter curve profile TOML from live fan spec (no root needed)
+    Init {
+        /// Output path; defaults to $XDG_CONFIG_HOME/msf/profile.toml (or ~/.config/msf/profile.toml)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Policy: shape of the temp→RPM curve
+        #[arg(long, value_enum, default_value_t = PolicyArg::Balanced)]
+        profile: PolicyArg,
+        /// Overwrite existing file
+        #[arg(long)]
+        force: bool,
+    },
     /// Run a temperature-driven curve loop until TTL or Ctrl+C (root required)
     Run {
         /// Path to TOML curve config
@@ -78,6 +93,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum PolicyArg {
+    Quiet,
+    Balanced,
+    Cool,
+}
+
+impl From<PolicyArg> for Policy {
+    fn from(p: PolicyArg) -> Self {
+        match p {
+            PolicyArg::Quiet => Policy::Quiet,
+            PolicyArg::Balanced => Policy::Balanced,
+            PolicyArg::Cool => Policy::Cool,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -112,6 +144,11 @@ fn main() -> Result<()> {
             selected,
         } => run_monitor(json, interval_secs, ticks, selected),
         Command::Calibrate { action } => run_calibrate(action),
+        Command::Init {
+            output,
+            profile,
+            force,
+        } => run_init(output, profile.into(), force),
         Command::Probe { json } => run_probe(json),
         Command::Set {
             fan,
@@ -334,11 +371,60 @@ fn run_set(fan: u8, rpm: f64, duration_secs: u64, no_clamp: bool, json: bool) ->
     std::process::exit(code);
 }
 
-fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("msf run requires root (writes SMC keys). Re-run with sudo.");
-        std::process::exit(2);
+fn run_init(output: Option<PathBuf>, policy: Policy, force: bool) -> Result<()> {
+    let target_path = match output {
+        Some(p) => p,
+        None => profile_path()?,
+    };
+
+    check_overwrite(&target_path, force)?;
+
+    let host = Host::detect()?;
+    let probe = msf_smc::probe()?;
+    if let Some(reason) = probe.not_controllable_reason() {
+        eprintln!("warning: host probed as not-controllable: {reason}");
     }
+    let fans = msf_smc::read_fans()?;
+    if fans.is_empty() {
+        bail!("read_fans returned 0 fans");
+    }
+    if fans.len() != probe.fan_count as usize {
+        eprintln!(
+            "warning: probe fan_count={} disagrees with read_fans count={}",
+            probe.fan_count,
+            fans.len()
+        );
+    }
+
+    let primary = &fans[0];
+    let curve = policy.materialize(primary.min_rpm, primary.max_rpm);
+
+    let specs: Vec<FanSpec> = fans
+        .iter()
+        .map(|f| FanSpec {
+            index: f.index,
+            min_rpm: f.min_rpm,
+            max_rpm: f.max_rpm,
+        })
+        .collect();
+
+    let body = render_profile(&host, &specs, policy, &curve);
+
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target_path, body)?;
+
+    eprintln!("wrote {} ({} policy)", target_path.display(), policy.name());
+    eprintln!(
+        "next:  sudo msf run --curve {} --fan 0 --duration-secs 600",
+        target_path.display()
+    );
+    Ok(())
+}
+
+fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Result<()> {
+    let is_root = unsafe { libc::geteuid() } == 0;
 
     let curve = Curve::load(&curve_path)?;
 
@@ -359,6 +445,17 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
         .iter()
         .find(|f| f.index == fan)
         .ok_or_else(|| anyhow::anyhow!("fan {fan} not found in read_fans"))?;
+
+    if !is_root {
+        eprintln!(
+            "smoke OK: curve has {} points, fan {} controllable (Mn={:.0}/Mx={:.0}). Re-run with sudo to activate.",
+            curve.points.len(),
+            fan,
+            live.min_rpm,
+            live.max_rpm
+        );
+        return Ok(());
+    }
 
     let host = Host::detect()?;
     let allowlist: Option<HashSet<String>> = match Calibration::load()? {
