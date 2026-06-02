@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +133,108 @@ pub fn clamp_rpm(target: f64, min: f64, max: f64) -> f64 {
     target.clamp(min, max)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CurvePoint {
+    pub temp_c: f64,
+    pub rpm: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Curve {
+    pub points: Vec<CurvePoint>,
+}
+
+impl Curve {
+    pub fn load(path: &Path) -> Result<Self> {
+        let s = fs::read_to_string(path)
+            .map_err(|e| anyhow!("read curve file {}: {e}", path.display()))?;
+        let c: Self = toml::from_str(&s)?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.points.len() < 2 {
+            return Err(anyhow!("curve must have ≥2 points (got {})", self.points.len()));
+        }
+        for w in self.points.windows(2) {
+            if w[1].temp_c <= w[0].temp_c {
+                return Err(anyhow!(
+                    "points must be strictly sorted by temp_c (got {} then {})",
+                    w[0].temp_c,
+                    w[1].temp_c
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn evaluate(&self, t: f64) -> f64 {
+        let pts = &self.points;
+        if t <= pts[0].temp_c {
+            return pts[0].rpm;
+        }
+        let last = pts.len() - 1;
+        if t >= pts[last].temp_c {
+            return pts[last].rpm;
+        }
+        for w in pts.windows(2) {
+            if t >= w[0].temp_c && t <= w[1].temp_c {
+                let span = w[1].temp_c - w[0].temp_c;
+                if span == 0.0 {
+                    return w[0].rpm;
+                }
+                let r = (t - w[0].temp_c) / span;
+                return w[0].rpm + r * (w[1].rpm - w[0].rpm);
+            }
+        }
+        pts[last].rpm
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AsymmetricEma {
+    pub rise_alpha: f64,
+    pub fall_alpha: f64,
+    state: Option<f64>,
+}
+
+impl AsymmetricEma {
+    pub fn new(rise_alpha: f64, fall_alpha: f64) -> Self {
+        Self {
+            rise_alpha,
+            fall_alpha,
+            state: None,
+        }
+    }
+
+    pub fn update(&mut self, sample: f64) -> f64 {
+        if sample.is_nan() {
+            return self.state.unwrap_or(sample);
+        }
+        match self.state {
+            None => {
+                self.state = Some(sample);
+                sample
+            }
+            Some(prev) => {
+                let alpha = if sample > prev {
+                    self.rise_alpha
+                } else {
+                    self.fall_alpha
+                };
+                let next = prev + alpha * (sample - prev);
+                self.state = Some(next);
+                next
+            }
+        }
+    }
+
+    pub fn current(&self) -> Option<f64> {
+        self.state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +326,160 @@ mod tests {
     fn clamp_rpm_nan_returns_min() {
         let v = clamp_rpm(f64::NAN, 1200.0, 5779.0);
         assert_eq!(v, 1200.0);
+    }
+
+    fn curve(pts: &[(f64, f64)]) -> Curve {
+        Curve {
+            points: pts
+                .iter()
+                .map(|&(t, r)| CurvePoint { temp_c: t, rpm: r })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn curve_validates_minimum_points() {
+        assert!(curve(&[(50.0, 1200.0)]).validate().is_err());
+        assert!(curve(&[]).validate().is_err());
+        assert!(curve(&[(50.0, 1200.0), (80.0, 4000.0)]).validate().is_ok());
+    }
+
+    #[test]
+    fn curve_rejects_unsorted_or_duplicate_points() {
+        assert!(
+            curve(&[(80.0, 4000.0), (50.0, 1200.0)])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            curve(&[(50.0, 1200.0), (50.0, 2000.0)])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn curve_below_first_returns_first_rpm() {
+        let c = curve(&[(50.0, 1200.0), (80.0, 4000.0)]);
+        assert_eq!(c.evaluate(0.0), 1200.0);
+        assert_eq!(c.evaluate(50.0), 1200.0);
+    }
+
+    #[test]
+    fn curve_above_last_returns_last_rpm() {
+        let c = curve(&[(50.0, 1200.0), (80.0, 4000.0)]);
+        assert_eq!(c.evaluate(100.0), 4000.0);
+        assert_eq!(c.evaluate(80.0), 4000.0);
+    }
+
+    #[test]
+    fn curve_interpolates_linearly_between_points() {
+        let c = curve(&[(50.0, 1200.0), (80.0, 4000.0)]);
+        assert_eq!(c.evaluate(65.0), 2600.0);
+    }
+
+    #[test]
+    fn curve_handles_multi_segment_piecewise() {
+        let c = curve(&[(40.0, 1000.0), (60.0, 2000.0), (80.0, 5000.0)]);
+        assert_eq!(c.evaluate(50.0), 1500.0);
+        assert_eq!(c.evaluate(70.0), 3500.0);
+    }
+
+    #[test]
+    fn curve_eval_same_temp_adjacent_returns_first_rpm() {
+        // validate() rejects this shape, but evaluate() must not divide by zero
+        // if it ever reaches the same-temp segment.
+        let c = Curve {
+            points: vec![
+                CurvePoint { temp_c: 50.0, rpm: 1200.0 },
+                CurvePoint { temp_c: 50.0, rpm: 2000.0 },
+                CurvePoint { temp_c: 70.0, rpm: 3500.0 },
+            ],
+        };
+        assert_eq!(c.evaluate(50.0), 1200.0);
+    }
+
+    #[test]
+    fn curve_parser_accepts_valid_toml() {
+        let s = r#"
+            [[points]]
+            temp_c = 40.0
+            rpm = 1200.0
+
+            [[points]]
+            temp_c = 70.0
+            rpm = 3500.0
+        "#;
+        let c: Curve = toml::from_str(s).unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.points.len(), 2);
+    }
+
+    #[test]
+    fn curve_parser_rejects_single_point_toml() {
+        let s = r#"
+            [[points]]
+            temp_c = 40.0
+            rpm = 1200.0
+        "#;
+        let c: Curve = toml::from_str(s).unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn curve_parser_rejects_empty_points_toml() {
+        let s = "points = []";
+        let c: Curve = toml::from_str(s).unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn curve_parser_rejects_unsorted_toml() {
+        let s = r#"
+            [[points]]
+            temp_c = 70.0
+            rpm = 3500.0
+
+            [[points]]
+            temp_c = 40.0
+            rpm = 1200.0
+        "#;
+        let c: Curve = toml::from_str(s).unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn ema_initializes_with_first_sample() {
+        let mut e = AsymmetricEma::new(0.7, 0.15);
+        assert_eq!(e.update(42.0), 42.0);
+        assert_eq!(e.current(), Some(42.0));
+    }
+
+    #[test]
+    fn ema_uses_rise_alpha_when_increasing() {
+        let mut e = AsymmetricEma::new(0.7, 0.15);
+        e.update(40.0);
+        let v = e.update(60.0);
+        let expected = 40.0 + 0.7 * (60.0 - 40.0);
+        assert!((v - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ema_uses_fall_alpha_when_decreasing() {
+        let mut e = AsymmetricEma::new(0.7, 0.15);
+        e.update(60.0);
+        let v = e.update(40.0);
+        let expected = 60.0 + 0.15 * (40.0 - 60.0);
+        assert!((v - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ema_nan_is_ignored() {
+        let mut e = AsymmetricEma::new(0.7, 0.15);
+        e.update(50.0);
+        let v = e.update(f64::NAN);
+        assert_eq!(v, 50.0);
+        assert_eq!(e.current(), Some(50.0));
     }
 
     #[test]

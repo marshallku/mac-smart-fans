@@ -1,9 +1,10 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use msf_core::{Calibration, Host, Reading, SensorSource, clamp_rpm};
+use msf_core::{AsymmetricEma, Calibration, Curve, Host, Reading, SensorSource, clamp_rpm};
 use msf_smc::{FanProbe, KeyInfo, ManualFanSession};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -62,6 +63,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run a temperature-driven curve loop until TTL or Ctrl+C (root required)
+    Run {
+        /// Path to TOML curve config
+        #[arg(long)]
+        curve: PathBuf,
+        /// Fan index to control
+        #[arg(long, default_value_t = 0)]
+        fan: u8,
+        /// How long to run before auto-restore
+        #[arg(long, default_value_t = 60)]
+        duration_secs: u64,
+        /// Emit one JSON object per state transition + per tick
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,19 +120,42 @@ fn main() -> Result<()> {
             no_clamp,
             json,
         } => run_set(fan, rpm, duration_secs, no_clamp, json),
+        Command::Run {
+            curve,
+            fan,
+            duration_secs,
+            json,
+        } => run_curve(curve, fan, duration_secs, json),
     }
 }
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum SetEvent<'a> {
-    Armed { fan: u8, mode_key_type: &'a str },
-    TargetWritten { fan: u8, target_rpm: f64 },
-    Trip { sensor: &'a str, celsius: f64 },
+    Armed {
+        fan: u8,
+        mode_key_type: &'a str,
+    },
+    TargetWritten {
+        fan: u8,
+        target_rpm: f64,
+    },
+    Tick {
+        t: u64,
+        max_temp_c: f64,
+        target_rpm: f64,
+    },
+    Trip {
+        sensor: &'a str,
+        celsius: f64,
+    },
     RestoreStarted,
     RestoreDone,
     RestoreFailed,
-    Exit { code: i32, reason: &'a str },
+    Exit {
+        code: i32,
+        reason: &'a str,
+    },
 }
 
 fn emit_event(json: bool, ev: &SetEvent<'_>) {
@@ -137,6 +176,16 @@ impl std::fmt::Debug for SetEvent<'_> {
             }
             SetEvent::TargetWritten { fan, target_rpm } => {
                 write!(f, "target_written: fan={fan} target_rpm={target_rpm}")
+            }
+            SetEvent::Tick {
+                t,
+                max_temp_c,
+                target_rpm,
+            } => {
+                write!(
+                    f,
+                    "tick: t={t} max_temp_c={max_temp_c:.2} target_rpm={target_rpm:.0}"
+                )
             }
             SetEvent::Trip { sensor, celsius } => {
                 write!(f, "TRIP: {sensor}={celsius:.1}°C")
@@ -252,6 +301,159 @@ fn run_set(fan: u8, rpm: f64, duration_secs: u64, no_clamp: bool, json: bool) ->
             break;
         }
         std::thread::sleep(Duration::from_millis(1000));
+    }
+
+    if let Some((name, c)) = &tripped {
+        emit_event(
+            json,
+            &SetEvent::Trip {
+                sensor: name,
+                celsius: *c,
+            },
+        );
+    }
+
+    emit_event(json, &SetEvent::RestoreStarted);
+    let restore_ok = session.restore().unwrap_or(false);
+    if restore_ok {
+        emit_event(json, &SetEvent::RestoreDone);
+    } else {
+        emit_event(json, &SetEvent::RestoreFailed);
+    }
+
+    let (code, reason): (i32, &str) = if !restore_ok {
+        (3, "restore_failed")
+    } else if tripped.is_some() {
+        (4, "sensor_trip")
+    } else if stop.load(Ordering::SeqCst) {
+        (0, "sigint")
+    } else {
+        (0, "ttl")
+    };
+    emit_event(json, &SetEvent::Exit { code, reason });
+    std::process::exit(code);
+}
+
+fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("msf run requires root (writes SMC keys). Re-run with sudo.");
+        std::process::exit(2);
+    }
+
+    let curve = Curve::load(&curve_path)?;
+
+    let probe = msf_smc::probe()?;
+    if fan >= probe.fan_count {
+        bail!(
+            "fan {fan} out of range (probe reports fan_count={})",
+            probe.fan_count
+        );
+    }
+    let fp = &probe.fans[fan as usize];
+    let (Some(md_info), Some(tg_info), Some(casing)) = (&fp.md, &fp.tg, fp.mode_key_casing) else {
+        bail!("fan {fan} not controllable: Md/Tg/casing missing in probe");
+    };
+
+    let fan_readings = msf_smc::read_fans()?;
+    let live = fan_readings
+        .iter()
+        .find(|f| f.index == fan)
+        .ok_or_else(|| anyhow::anyhow!("fan {fan} not found in read_fans"))?;
+
+    let host = Host::detect()?;
+    let allowlist: Option<HashSet<String>> = match Calibration::load()? {
+        Some(c) if c.matches_host(&host) => Some(c.sensors.into_keys().collect()),
+        Some(_) => {
+            eprintln!(
+                "warning: calibration host mismatch; degraded trip — scanning all HID sensors"
+            );
+            None
+        }
+        None => {
+            eprintln!("warning: no calibration; degraded trip — scanning all HID sensors");
+            None
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))?;
+    }
+
+    let mut session = ManualFanSession::arm(fan, casing, md_info)?;
+    emit_event(
+        json,
+        &SetEvent::Armed {
+            fan,
+            mode_key_type: &md_info.data_type,
+        },
+    );
+
+    let mut emas: HashMap<String, AsymmetricEma> = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(duration_secs);
+    let mut tripped: Option<(String, f64)> = None;
+    let mut target_written_emitted = false;
+
+    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        let temps = msf_hid::read_all().unwrap_or_default();
+
+        let mut raw_max = f64::NEG_INFINITY;
+        let mut ema_max = f64::NEG_INFINITY;
+        for s in &temps {
+            let in_scope = allowlist.as_ref().is_none_or(|a| a.contains(&s.name));
+            if !in_scope {
+                continue;
+            }
+            if s.celsius >= TRIP_THRESHOLD_C {
+                tripped = Some((s.name.clone(), s.celsius));
+            }
+            if s.celsius > raw_max {
+                raw_max = s.celsius;
+            }
+            let e = emas
+                .entry(s.name.clone())
+                .or_insert_with(|| AsymmetricEma::new(0.7, 0.15));
+            let v = e.update(s.celsius);
+            if v > ema_max {
+                ema_max = v;
+            }
+        }
+
+        if tripped.is_some() {
+            break;
+        }
+
+        if !ema_max.is_finite() {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        let raw_target = curve.evaluate(ema_max);
+        let target = clamp_rpm(raw_target, live.min_rpm, live.max_rpm);
+        session.write_target(tg_info, target)?;
+
+        if !target_written_emitted {
+            emit_event(
+                json,
+                &SetEvent::TargetWritten {
+                    fan,
+                    target_rpm: target,
+                },
+            );
+            target_written_emitted = true;
+        }
+
+        emit_event(
+            json,
+            &SetEvent::Tick {
+                t: now_ms(),
+                max_temp_c: ema_max,
+                target_rpm: target,
+            },
+        );
+
+        std::thread::sleep(Duration::from_secs(1));
     }
 
     if let Some((name, c)) = &tripped {
