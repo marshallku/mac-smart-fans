@@ -435,6 +435,10 @@ enum SetEvent<'a> {
         max_temp_c: f64,
         target_rpm: f64,
     },
+    Rearm {
+        attempt: u32,
+    },
+    RearmSuccess,
     Trip {
         sensor: &'a str,
         celsius: f64,
@@ -477,6 +481,10 @@ impl std::fmt::Debug for SetEvent<'_> {
                     "tick: t={t} max_temp_c={max_temp_c:.2} target_rpm={target_rpm:.0}"
                 )
             }
+            SetEvent::Rearm { attempt } => {
+                write!(f, "rearm: attempt={attempt}")
+            }
+            SetEvent::RearmSuccess => write!(f, "rearm_success"),
             SetEvent::Trip { sensor, celsius } => {
                 write!(f, "TRIP: {sensor}={celsius:.1}°C")
             }
@@ -487,6 +495,28 @@ impl std::fmt::Debug for SetEvent<'_> {
         }
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum DriftOutcome {
+    Recovered,
+    Retry { attempt: u32 },
+    Trip,
+}
+
+fn handle_drift_outcome(success: bool, consecutive_fails: u32) -> DriftOutcome {
+    if success {
+        DriftOutcome::Recovered
+    } else {
+        let new_fails = consecutive_fails + 1;
+        if new_fails >= 3 {
+            DriftOutcome::Trip
+        } else {
+            DriftOutcome::Retry { attempt: new_fails }
+        }
+    }
+}
+
+const REARM_SENTINEL: &str = "<rearm-fail>";
 
 const TRIP_THRESHOLD_C: f64 = 90.0;
 
@@ -611,8 +641,13 @@ fn run_set(fan: u8, rpm: f64, duration_secs: u64, no_clamp: bool, json: bool) ->
         emit_event(json, &SetEvent::RestoreFailed);
     }
 
+    let is_rearm_trip = tripped
+        .as_ref()
+        .is_some_and(|(name, _)| name == REARM_SENTINEL);
     let (code, reason): (i32, &str) = if !restore_ok {
         (3, "restore_failed")
+    } else if is_rearm_trip {
+        (5, "rearm_failed")
     } else if tripped.is_some() {
         (4, "sensor_trip")
     } else if stop.load(Ordering::SeqCst) {
@@ -744,6 +779,7 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
     let mut tripped: Option<(String, f64)> = None;
     let mut target_written_emitted = false;
+    let mut consecutive_rearm_fails: u32 = 0;
 
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         let temps = msf_hid::read_all().unwrap_or_default();
@@ -803,6 +839,38 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
             },
         );
 
+        // Drift detection: if F{N}Md has fallen back to 0 (sleep/wake firmware reset,
+        // thermalmonitord override, etc), re-arm via the same direct-mode write path.
+        // SMC read errors are treated as drift attempts so a stale handle after sleep
+        // wakes the 3-strike escalation rather than silently looping.
+        let drift_detected = match session.read_mode() {
+            Ok(mode) => mode < 0.5,
+            Err(_) => true,
+        };
+        if drift_detected {
+            let attempt = consecutive_rearm_fails + 1;
+            emit_event(json, &SetEvent::Rearm { attempt });
+            let outcome = match session.re_arm() {
+                Ok(success) => handle_drift_outcome(success, consecutive_rearm_fails),
+                Err(_) => handle_drift_outcome(false, consecutive_rearm_fails),
+            };
+            match outcome {
+                DriftOutcome::Recovered => {
+                    emit_event(json, &SetEvent::RearmSuccess);
+                    consecutive_rearm_fails = 0;
+                }
+                DriftOutcome::Retry { attempt: _ } => {
+                    consecutive_rearm_fails += 1;
+                }
+                DriftOutcome::Trip => {
+                    tripped = Some((REARM_SENTINEL.to_string(), f64::NAN));
+                    break;
+                }
+            }
+        } else {
+            consecutive_rearm_fails = 0;
+        }
+
         std::thread::sleep(Duration::from_secs(1));
     }
 
@@ -824,8 +892,13 @@ fn run_curve(curve_path: PathBuf, fan: u8, duration_secs: u64, json: bool) -> Re
         emit_event(json, &SetEvent::RestoreFailed);
     }
 
+    let is_rearm_trip = tripped
+        .as_ref()
+        .is_some_and(|(name, _)| name == REARM_SENTINEL);
     let (code, reason): (i32, &str) = if !restore_ok {
         (3, "restore_failed")
+    } else if is_rearm_trip {
+        (5, "rearm_failed")
     } else if tripped.is_some() {
         (4, "sensor_trip")
     } else if stop.load(Ordering::SeqCst) {
@@ -1183,5 +1256,28 @@ mod tests {
             Some(PathBuf::from("/cur/msf"))
         });
         assert_eq!(v, PathBuf::from("/arg/msf"));
+    }
+
+    #[test]
+    fn handle_drift_recovered_on_success() {
+        assert_eq!(handle_drift_outcome(true, 0), DriftOutcome::Recovered);
+        assert_eq!(handle_drift_outcome(true, 2), DriftOutcome::Recovered);
+    }
+
+    #[test]
+    fn handle_drift_retry_on_first_and_second_fail() {
+        assert_eq!(
+            handle_drift_outcome(false, 0),
+            DriftOutcome::Retry { attempt: 1 }
+        );
+        assert_eq!(
+            handle_drift_outcome(false, 1),
+            DriftOutcome::Retry { attempt: 2 }
+        );
+    }
+
+    #[test]
+    fn handle_drift_trips_on_third_consecutive_fail() {
+        assert_eq!(handle_drift_outcome(false, 2), DriftOutcome::Trip);
     }
 }

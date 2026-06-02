@@ -474,9 +474,72 @@ impl ManualFanSession {
         Ok(false)
     }
 
+    /// Read the live F{N}Md value. Errors propagate so a stale SMC handle (e.g. after a
+    /// sleep/wake transition) surfaces to the caller instead of being silently treated as
+    /// "no drift".
+    pub fn read_mode(&self) -> Result<f64> {
+        let (info, bytes) = self.smc.read_key(self.mode_key)?;
+        decode_numeric(&info, &bytes).ok_or_else(|| {
+            anyhow!(
+                "could not decode F{}Md ({}/{})",
+                self.fan_index,
+                self.mode_type,
+                self.mode_size
+            )
+        })
+    }
+
+    /// Re-arm manual mode after a drift (e.g. sleep/wake firmware reset, thermalmonitord
+    /// override). Writes Md=1, sleeps 500ms, verifies readback. No-op if session is
+    /// already restored or was never armed.
+    pub fn re_arm(&mut self) -> Result<bool> {
+        if !Self::needs_re_arm(self.armed, self.restored) {
+            return Ok(false);
+        }
+        let fcc = fourcc_from_str(&self.mode_type)?;
+        let payload = encode_one(&self.mode_type, self.mode_size)?;
+        self.smc.write_key(self.mode_key, fcc, &payload)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (rb_info, rb_bytes) = self.smc.read_key(self.mode_key)?;
+        let readback = decode_numeric(&rb_info, &rb_bytes);
+        Ok(matches!(
+            Self::re_arm_decision(self.armed, self.restored, readback),
+            ReArmDecision::Success
+        ))
+    }
+
+    /// Pure state check: a re-arm SMC write is needed only when the session is currently
+    /// armed and has not been restored.
+    pub fn needs_re_arm(armed: bool, restored: bool) -> bool {
+        armed && !restored
+    }
+
+    /// Pure decision function for the re_arm state machine. Lets unit tests exercise
+    /// all three branches without a real SMC connection.
+    pub fn re_arm_decision(
+        armed: bool,
+        restored: bool,
+        readback: Option<f64>,
+    ) -> ReArmDecision {
+        if !Self::needs_re_arm(armed, restored) {
+            return ReArmDecision::Skip;
+        }
+        match readback {
+            Some(rb) if rb >= 0.5 => ReArmDecision::Success,
+            _ => ReArmDecision::Failed,
+        }
+    }
+
     pub fn fan_index(&self) -> u8 {
         self.fan_index
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReArmDecision {
+    Skip,
+    Success,
+    Failed,
 }
 
 impl Drop for ManualFanSession {
@@ -746,6 +809,58 @@ mod tests {
         let v = fourcc_from_str("F0Md").unwrap();
         assert_eq!(v, fourcc(b"F0Md"));
         assert!(fourcc_from_str("F0M").is_err());
+    }
+
+    #[test]
+    fn needs_re_arm_only_when_armed_and_not_restored() {
+        assert!(ManualFanSession::needs_re_arm(true, false));
+        assert!(!ManualFanSession::needs_re_arm(false, false));
+        assert!(!ManualFanSession::needs_re_arm(true, true));
+        assert!(!ManualFanSession::needs_re_arm(false, true));
+    }
+
+    #[test]
+    fn re_arm_decision_skips_when_session_inactive() {
+        assert_eq!(
+            ManualFanSession::re_arm_decision(false, false, Some(0.0)),
+            ReArmDecision::Skip
+        );
+        assert_eq!(
+            ManualFanSession::re_arm_decision(true, true, Some(1.0)),
+            ReArmDecision::Skip
+        );
+        assert_eq!(
+            ManualFanSession::re_arm_decision(false, true, None),
+            ReArmDecision::Skip
+        );
+    }
+
+    #[test]
+    fn re_arm_decision_success_when_readback_at_or_above_half() {
+        assert_eq!(
+            ManualFanSession::re_arm_decision(true, false, Some(1.0)),
+            ReArmDecision::Success
+        );
+        assert_eq!(
+            ManualFanSession::re_arm_decision(true, false, Some(0.5)),
+            ReArmDecision::Success
+        );
+    }
+
+    #[test]
+    fn re_arm_decision_failed_when_readback_low_or_none() {
+        assert_eq!(
+            ManualFanSession::re_arm_decision(true, false, Some(0.0)),
+            ReArmDecision::Failed
+        );
+        assert_eq!(
+            ManualFanSession::re_arm_decision(true, false, Some(0.49)),
+            ReArmDecision::Failed
+        );
+        assert_eq!(
+            ManualFanSession::re_arm_decision(true, false, None),
+            ReArmDecision::Failed
+        );
     }
 
     #[test]
