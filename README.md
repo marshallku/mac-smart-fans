@@ -21,8 +21,8 @@ See [INSTALL.md](./INSTALL.md) for sudoers setup, daemon install, and uninstall 
 ```sh
 msf monitor                                      # stream HID temperatures
 msf probe                                        # SMC fan capability report
-msf calibrate add cpu <hid-id>                   # tag sensors for curve trip logic
-msf init --profile balanced -o curve.toml        # generate a starter curve
+msf calibrate add "PMU tdie0"                    # allowlist a sensor (name from `msf monitor`)
+msf init --profile balanced --output curve.toml  # generate a starter curve
 sudo msf set 0 2500 --duration-secs 5            # one-shot fan set (auto-restore)
 sudo msf run --curve curve.toml                  # foreground curve loop (all fans by default)
 sudo msf install --curve curve.toml              # install as launchd daemon (all fans by default)
